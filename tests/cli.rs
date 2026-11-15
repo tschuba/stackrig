@@ -146,3 +146,54 @@ fn import_refuses_when_application_with_files_is_running() {
     assert!(out(&o).contains("nothing imported: application(s) app still running"), "{}", out(&o));
     assert!(!t.join("app").exists(), "nothing may be written");
 }
+
+const IMPORT_LOCK: &str = "import coolify: waiting for `strig migrate coolify` (render/up would create new random values)";
+
+/// Fake Coolify host with services `svc` (uuid u1), `hand` (u2) and `new` (u3, never imported); `svc` has a running container
+/// holding the generated password and mounting /srv/data. Service env file: one user var, one generated secret.
+fn coolify_migrate_env(name: &str) -> (Env, PathBuf) {
+    let e = Env::new(name);
+    e.script("sudo", "shift\ncase \"$*\" in\n *psql*) printf 'u1,svc\\nu2,hand\\nu3,new\\n';;\n *Mounts*) echo 'u1 /srv/data ';;\n 'docker ps -a'*u1*) echo svc-c-1;;\n 'docker inspect svc-c-1'*) printf 'SERVICE_PASSWORD_DB=secret\\nMY_VAR=1\\n';;\n 'cat '*/u1/.env|'cat '*/u2/.env|'cat '*/u3/.env) printf 'MY_VAR=1\\nSERVICE_PASSWORD_DB=secret\\n';;\nesac");
+    let t = e.root.join("target");
+    let compose = "services:\n  a:\n    image: x\n    environment:\n      - P=${SERVICE_PASSWORD_DB}\n    volumes:\n      - /srv/data:/d\n";
+    for n in ["svc", "hand"] {
+        fs::create_dir_all(t.join(n)).unwrap();
+        fs::write(t.join(n).join("docker-compose.yml"), compose).unwrap();
+    }
+    fs::write(t.join("svc/.env"), "MY_VAR=1\n").unwrap();
+    fs::write(t.join("svc/.lock"), IMPORT_LOCK).unwrap();
+    fs::write(t.join("hand/.lock"), "do not touch").unwrap();
+    (e, t)
+}
+
+#[test]
+fn migrate_takes_over_secrets_unlocks_and_warns_about_bind_mounts() {
+    let (e, t) = coolify_migrate_env("migrate");
+    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]);
+    let s = out(&o);
+    // `new` was never imported -> error -> exit 1, but the others are still processed
+    assert_eq!(o.status.code(), Some(1), "{s}");
+    assert!(s.contains("svc: 1 lines of .env.generated taken over, render OK, 2/2 values found in running containers"), "{s}");
+    assert!(s.contains("WARNING bind mount /srv/data is used by a running container (project u1)"), "{s}");
+    assert!(s.contains("ERROR    new: no docker-compose.yml, run `import coolify` first"), "{s}");
+    assert_eq!(fs::read_to_string(t.join("svc/.env.generated")).unwrap(), "SERVICE_PASSWORD_DB=secret\n");
+    assert!(!t.join("svc/.lock").exists(), "import lock must be removed");
+}
+
+#[test]
+fn migrate_skips_a_hand_made_lock() {
+    let (e, t) = coolify_migrate_env("handlock");
+    let s = out(&e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]));
+    assert!(s.contains("hand: SKIPPED, locked (.lock): do not touch"), "{s}");
+    assert_eq!(fs::read_to_string(t.join("hand/.lock")).unwrap(), "do not touch");
+    assert!(!t.join("hand/.env.generated").exists());
+}
+
+#[test]
+fn migrate_is_idempotent_and_never_overwrites_generated_values() {
+    let (e, t) = coolify_migrate_env("idem");
+    fs::write(t.join("svc/.env.generated"), "SERVICE_PASSWORD_DB=mine\n").unwrap();
+    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]);
+    assert!(out(&o).contains("ERROR    svc"), "write_new must refuse to overwrite: {}", out(&o));
+    assert_eq!(fs::read_to_string(t.join("svc/.env.generated")).unwrap(), "SERVICE_PASSWORD_DB=mine\n");
+}
