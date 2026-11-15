@@ -1,0 +1,19 @@
+name: repo-settings
+on:
+  push:
+    branches: [master]
+    paths: [scripts/repo-settings.sh]
+  schedule:
+    - cron: "17 5 * * 1" # weekly, resets manual UI drift
+  workflow_dispatch:
+permissions: {}
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/repo-settings.sh
+        env:
+          GH_REPO: ${{ github.repository }}
+          # GITHUB_TOKEN cannot change repo settings; needs a PAT with repo admin
+          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
