@@ -24,3 +24,27 @@ fn migrate_dry_run_leaves_target_untouched() {
     assert!(!Path::new(&target.join("svc/.env.generated")).exists());
     fs::remove_dir_all(&root).unwrap();
 }
+
+/// `import --dry-run` must report like a real run but create nothing below the target.
+#[test]
+fn import_dry_run_writes_nothing() {
+    let root = std::env::temp_dir().join(format!("strig-dry-import-{}", std::process::id()));
+    let (bin, target) = (root.join("bin"), root.join("target"));
+    fs::create_dir_all(&bin).unwrap();
+    // fake `sudo -n ...`: no applications, one service `svc` (uuid u1) with a compose and a user variable
+    let sudo = bin.join("sudo");
+    fs::write(&sudo, "#!/bin/sh\nshift\ncase \"$*\" in\n *'from applications'*) ;;\n *'from services order'*) echo u1,svc;;\n *docker_compose_raw*) printf 'services:\\n  a:\\n    image: x\\n';;\n 'cat '*) echo MY_VAR=1;;\nesac\n").unwrap();
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |extra: &[&str]| Command::new(env!("CARGO_BIN_EXE_strig")).args(["import", "coolify", "local"]).arg(&target).args(extra)
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())).output().unwrap();
+
+    let out = run(&["--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("svc: .env: 1 lines"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!target.exists(), "dry run must not create the target");
+
+    // control: the same call without the flag does write (keeps the test above honest)
+    assert!(run(&[]).status.success());
+    assert!(target.join("svc/docker-compose.yml").exists());
+    fs::remove_dir_all(&root).unwrap();
+}
