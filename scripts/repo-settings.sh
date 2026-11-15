@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent: applies the repo settings the release workflows need. Usage: scripts/repo-settings.sh
 set -euo pipefail
-R=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-B=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+R=${GH_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}
+B=$(gh api "repos/$R" -q .default_branch) # REST: PAT needs no Contents scope
 
 # squash-only, PR title becomes the commit message (read by release-please)
 gh api -X PATCH "repos/$R" \
