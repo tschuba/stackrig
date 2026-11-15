@@ -26,7 +26,7 @@ fn labels(stack: &str, svc: &str, domain: &str, port: u16) -> Vec<String> {
 }
 
 /// A `SERVICE_URL_X[_PORT]` / `SERVICE_FQDN_X[_PORT]` declaration: (is_url, id, full name, port, domain value).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct Decl { url: bool, id: String, full: String, port: u16, domain: Option<String> }
 
 fn declarations(env: &Value) -> Vec<Decl> {
@@ -128,7 +128,7 @@ fn render(path: &str, stack: &str) -> String {
     }
     let envp = std::path::Path::new(path).with_file_name(".env.generated");
     let existing = std::fs::read_to_string(&envp).map(|t| parse_env(&t)).unwrap_or_default();
-    let entries = env_entries(&text, &decls.iter().map(|(_, d)| Decl { ..clone_decl(d) }).collect::<Vec<_>>(), &existing)
+    let entries = env_entries(&text, &decls.iter().map(|(_, d)| d.clone()).collect::<Vec<_>>(), &existing)
         .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -138,7 +138,6 @@ fn render(path: &str, stack: &str) -> String {
     }
     for (svc, d) in &decls {
         let dom = entries.iter().find(|(k, _)| *k == d.full).unwrap().1.trim_start_matches("https://").to_string();
-        let _ = norm(svc);
         let ls = labels(stack, svc, &dom, d.port);
         let arr = doc["services"][svc].as_object_mut().unwrap().entry("labels").or_insert(Value::Array(vec![]));
         let arr = arr.as_array_mut().expect("map-form labels not handled");
@@ -516,7 +515,7 @@ fn doctor(args: &[String]) -> i32 {
     if fix { rest.remove(0); }
     let all = rest.first() == Some(&"--all");
     if all { rest.remove(0); }
-    if all && rest.is_empty() { eprintln!("usage: strig doctor [fix] [<stack-dir> | --all <dir-with-stack-dirs>]"); return 2; }
+    if all && rest.is_empty() { eprintln!("usage: strig doctor [fix] [<dir> | --all <root>]   (see `strig help doctor`)"); return 2; }
     let mut failed = doctor_host(fix);
     if let Some(d) = rest.first() {
         let root = std::path::Path::new(d);
@@ -529,13 +528,93 @@ fn doctor(args: &[String]) -> i32 {
     (failed > 0) as i32
 }
 
+const HELP: &str = "strig - run Coolify compose stacks without Coolify (Traefik labels, generated secrets, import/migrate)
+
+USAGE:
+    strig <command> [args]
+
+COMMANDS:
+    render      Print the final compose YAML of a stack (writes .env.generated)
+    up          Render and start a stack with `docker compose up`
+    doctor      Check host and stacks for problems
+    import      Copy services/applications from a Coolify host
+    migrate     Take over generated secrets from a Coolify host
+    help        Show help for a command: `strig help <command>`
+
+OPTIONS:
+    -h, --help       Show help (also per command: `strig <command> --help`)
+    -V, --version    Show version
+
+A stack is a directory with a compose file; its name (lowercase) is the compose project name.";
+
+fn help_for(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "render" => "strig render <dir> | strig render --all <root>
+
+Renders the compose file of <dir>: fills SERVICE_URL/FQDN/PASSWORD/... variables, adds Traefik
+labels, the project name and the external network `proxy`. The YAML goes to stdout.
+Side effect: creates/extends <dir>/.env.generated (mode 600); existing values are never changed.
+
+    --all <root>   Render every stack dir below <root>; prints OK/ERROR per stack, exit 1 on any error
+
+Refused if <dir>/.lock exists (its content is the reason).",
+        "up" => "strig up <dir> [compose up args]
+
+Renders <dir> into docker-compose.generated.yml and runs `docker compose up -d` with
+--env-file .env (if present) and .env.generated.
+Extra arguments replace the default `-d` and are passed to `docker compose up`.
+Refused if <dir>/.lock exists.",
+        "doctor" => "strig doctor [fix] [<dir> | --all <root>]
+
+Checks: Docker and Compose reachable, network `proxy`. With a dir: renders a temp copy and reports
+locks, render errors, variables without a value, secrets `up` would newly generate, and .env* readable by others.
+
+    fix          Create network `proxy`, set .env/.env.generated to mode 600
+    <dir>        Check one stack
+    --all <root> Check every stack dir below <root>
+
+Exit code 1 if errors remain (warnings do not count).",
+        "import" | "migrate" => "strig import|migrate coolify <host|local> <target-dir> [--dry-run]
+
+    import    Writes per Coolify service/application docker-compose.yml (domains filled in) and the
+              user's .env into <target-dir>/<name>/. Never overwrites. Sets .lock so render/up refuse
+              the stack until `migrate` ran.
+    migrate   Takes over the generated SERVICE_* secrets into .env.generated and removes the import
+              lock (only the one `import` wrote).
+
+    <host>      user@host over ssh (needs `sudo -n` for docker and /data/coolify), or `local` to run on the Coolify machine
+    --dry-run   Run the real code on a throw-away copy; nothing below <target-dir> changes
+
+Exit code 1 on errors (and for migrate when stacks need attention).",
+        _ => return None,
+    })
+}
+
+/// Handles `help`, `-h/--help`, `-V/--version`; returns the exit code if one applied.
+fn help_main(a: &[String]) -> Option<i32> {
+    let cmd = a.get(1).map(String::as_str);
+    let ask = |t: Option<&str>| match t.and_then(help_for) { Some(h) => { println!("{h}"); 0 } None => { println!("{HELP}"); 0 } };
+    match cmd {
+        None => { eprintln!("{HELP}"); Some(2) }
+        Some("-V" | "--version") => { println!("strig {}", env!("CARGO_PKG_VERSION")); Some(0) }
+        Some("-h" | "--help") => Some(ask(None)),
+        Some("help") => match a.get(2).map(String::as_str) {
+            Some(t) if help_for(t).is_none() => { eprintln!("error: unknown command `{t}`\n\n{HELP}"); Some(2) }
+            t => Some(ask(t)),
+        },
+        Some(c) if a[2..].iter().any(|x| x == "-h" || x == "--help") && help_for(c).is_some() => Some(ask(Some(c))),
+        _ => None,
+    }
+}
+
 fn main() {
     use std::process::{exit, Command};
     let mut a: Vec<String> = std::env::args().collect();
+    if let Some(c) = help_main(&a) { exit(c); }
     let dry = a.iter().skip(1).any(|x| x == "--dry-run");
     a.retain(|x| x != "--dry-run");
     if a.get(1).map(String::as_str) == Some("render") && a.get(2).map(String::as_str) == Some("--all") {
-        let Some(root) = a.get(3) else { eprintln!("usage: strig render --all <dir-with-stack-dirs>"); exit(2) };
+        let Some(root) = a.get(3) else { eprintln!("usage: strig render --all <root>   (see `strig help render`)"); exit(2) };
         exit(render_all(root));
     }
     if a.get(1).map(String::as_str) == Some("doctor") { exit(doctor(&a[2..])); }
@@ -551,13 +630,9 @@ fn main() {
         match r { Ok(n) => exit((n > 0) as i32), Err(e) => { eprintln!("error: {e}"); exit(1) } }
     }
     if matches!(a.get(1).map(String::as_str), Some("import" | "migrate")) {
-        eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--dry-run]   (host = user@host over ssh, local = run here)"); exit(2)
+        eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--dry-run]   (see `strig help import`)"); exit(2)
     }
-    let usage = || -> ! {
-        eprintln!("usage: strig render <dir> | render --all <dir> | up <dir> [compose up args] | doctor [fix] [<dir> | --all <dir>] | import|migrate coolify <host|local> <dir> [--dry-run]");
-        eprintln!("everything else: docker compose -p <stack> <command>   (stack = dir name, lowercase)");
-        exit(2)
-    };
+    let usage = || -> ! { eprintln!("{HELP}"); exit(2) };
     let (cmd, dir) = match (a.get(1).map(String::as_str), a.get(2)) { (Some(c @ ("render" | "up")), Some(d)) => (c, std::path::Path::new(d)), _ => usage() };
     let dir = dir.canonicalize().unwrap_or_else(|e| { eprintln!("{}: {e}", dir.display()); exit(1) });
     if let Ok(reason) = std::fs::read_to_string(dir.join(LOCK)) {
@@ -634,7 +709,6 @@ fn attach_proxy(doc: &mut Value, stack: &str, svcs: &[String]) {
     }
 }
 
-fn clone_decl(d: &Decl) -> Decl { Decl { url: d.url, id: d.id.clone(), full: d.full.clone(), port: d.port, domain: d.domain.clone() } }
 
 #[cfg(test)]
 mod tests {
