@@ -16,4 +16,4 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
           # GITHUB_TOKEN cannot change repo settings; needs a PAT with repo admin
-          GH_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.REPO_SETTINGS_TOKEN }}
