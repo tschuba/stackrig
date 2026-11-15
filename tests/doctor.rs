@@ -129,3 +129,12 @@ fn all_without_dir_is_a_usage_error() {
     assert_eq!(o.status.code(), Some(2));
     assert!(out(&o).contains("usage: strig doctor"), "{}", out(&o));
 }
+
+#[test]
+fn render_failure_is_reported_as_error() {
+    let e = Env::new("badyaml");
+    let d = e.stack("web", "services:\n  a:\n    image: x\n    labels:\n      traefik.enable: \"true\"\n    environment:\n      - SERVICE_FQDN_A\n");
+    let o = e.run(&[d.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(out(&o).contains("ERROR    web: render:"), "{}", out(&o));
+}

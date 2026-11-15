@@ -197,3 +197,14 @@ fn migrate_is_idempotent_and_never_overwrites_generated_values() {
     assert!(out(&o).contains("ERROR    svc"), "write_new must refuse to overwrite: {}", out(&o));
     assert_eq!(fs::read_to_string(t.join("svc/.env.generated")).unwrap(), "SERVICE_PASSWORD_DB=mine\n");
 }
+
+#[test]
+fn non_local_host_goes_over_ssh() {
+    let e = Env::new("ssh");
+    let log = e.root.join("ssh.log");
+    e.script("ssh", &format!("echo \"$@\" >> '{}'; exit 1", log.display()));
+    let o = e.run(&["import", "coolify", "me@pi", e.root.join("t").to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    let l = fs::read_to_string(&log).unwrap();
+    assert!(l.starts_with("-o BatchMode=yes me@pi sudo -n docker exec coolify-db"), "{l}");
+}

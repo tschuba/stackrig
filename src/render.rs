@@ -142,7 +142,7 @@ pub(crate) fn attach_proxy(doc: &mut Value, stack: &str, svcs: &[String]) {
             None => serde_json::Map::from_iter([("default".to_string(), Value::Null)]),
             Some(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_str().map(|k| (k.to_string(), Value::Null))).collect(),
             Some(Value::Object(m)) => m,
-            Some(_) => continue,
+            Some(other) => { def.insert("networks".into(), other); continue } // keep what we cannot merge
         };
         map.insert("proxy".into(), alias);
         def.insert("networks".into(), Value::Object(map));
@@ -192,6 +192,12 @@ mod tests {
         assert_eq!(v["networks"]["proxy"]["external"], true);
     }
 
+    #[test]
+    fn proxy_network_ignores_unexpected_networks_type() {
+        let mut v: Value = serde_saphyr::from_str("services:\n  a: {image: x, networks: foo}").unwrap();
+        attach_proxy(&mut v, "st", &["a".into()]);
+        assert_eq!(v["services"]["a"]["networks"], "foo");
+    }
     #[test]
     fn project_name() {
         let mut v: Value = serde_saphyr::from_str("name: other\nservices:\n  a: {image: x}").unwrap();
