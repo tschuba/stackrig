@@ -45,7 +45,7 @@ locks, render errors, variables without a value, secrets `up` would newly genera
     --all <root> Check every stack dir below <root>
 
 Exit code 1 if errors remain (warnings do not count).",
-        "import" | "migrate" => "strig import|migrate coolify <host|local> <target-dir> [--dry-run]
+        "import" | "migrate" => "strig import|migrate coolify <host|local> <target-dir> [--only a,b] [--dry-run]
 
     import    Writes per Coolify service/application docker-compose.yml (domains filled in) and the
               user's .env into <target-dir>/<name>/. Never overwrites. Sets .lock so render/up refuse
@@ -54,6 +54,7 @@ Exit code 1 if errors remain (warnings do not count).",
               lock (only the one `import` wrote).
 
     <host>      user@host over ssh (needs `sudo -n` for docker and /data/coolify), or `local` to run on the Coolify machine
+    --only a,b  Only these Coolify services/applications (default: all); unknown names are an error
     --dry-run   Run the real code on a throw-away copy; nothing below <target-dir> changes
 
 Exit code 1 on errors (and for migrate when stacks need attention).",

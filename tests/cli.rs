@@ -181,6 +181,17 @@ fn migrate_takes_over_secrets_unlocks_and_warns_about_bind_mounts() {
 }
 
 #[test]
+fn migrate_only_touches_the_named_stacks_and_rejects_unknown_names() {
+    let (e, t) = coolify_migrate_env("only");
+    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap(), "--only", "svc"]);
+    let s = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{s}");
+    assert!(s.contains("svc:") && !s.contains("new:") && !s.contains("hand:"), "{s}");
+    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap(), "--only", "nope"]);
+    assert!(out(&o).contains("--only nope: no such"), "{}", out(&o));
+}
+
+#[test]
 fn migrate_skips_a_hand_made_lock() {
     let (e, t) = coolify_migrate_env("handlock");
     let s = out(&e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]));

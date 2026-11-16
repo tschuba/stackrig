@@ -15,6 +15,13 @@ fn main() {
     if let Some(c) = help_main(&a) { exit(c); }
     let dry = a.iter().skip(1).any(|x| x == "--dry-run");
     a.retain(|x| x != "--dry-run");
+    // `--only a,b`: restrict import/migrate to these Coolify names
+    let mut only: Vec<String> = vec![];
+    if let Some(i) = a.iter().position(|x| x == "--only") {
+        let Some(v) = a.get(i + 1).cloned() else { eprintln!("--only needs a comma-separated list of names"); exit(2) };
+        only = v.split(',').filter(|n| !n.is_empty()).map(String::from).collect();
+        a.drain(i..=i + 1);
+    }
     if a.get(1).map(String::as_str) == Some("render") && a.get(2).map(String::as_str) == Some("--all") {
         let Some(root) = a.get(3) else { eprintln!("usage: strig render --all <root>   (see `strig help render`)"); exit(2) };
         exit(render_all(root));
@@ -27,12 +34,12 @@ fn main() {
             Some(t) => { if cmd == "migrate" { if let Err(e) = run_on("local", &format!("cp -a '{d}/.' '{t}/'")) { eprintln!("error: {e}"); exit(1) } } t }
             None => d,
         };
-        let r = if cmd == "import" { import_coolify(h, d).map(|m| { println!("{m}"); 0 }) } else { migrate_coolify(h, d) };
+        let r = if cmd == "import" { import_coolify(h, d, &only).map(|m| { println!("{m}"); 0 }) } else { migrate_coolify(h, d, &only) };
         if let Some(t) = &tmp { let _ = std::fs::remove_dir_all(t); eprintln!("dry run: nothing was written to the target"); }
         match r { Ok(n) => exit((n > 0) as i32), Err(e) => { eprintln!("error: {e}"); exit(1) } }
     }
     if matches!(a.get(1).map(String::as_str), Some("import" | "migrate")) {
-        eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--dry-run]   (see `strig help import`)"); exit(2)
+        eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--only a,b] [--dry-run]   (see `strig help import`)"); exit(2)
     }
     let usage = || -> ! { eprintln!("{HELP}"); exit(2) };
     let (cmd, dir) = match (a.get(1).map(String::as_str), a.get(2)) { (Some(c @ ("render" | "up")), Some(d)) => (c, std::path::Path::new(d)), _ => usage() };
