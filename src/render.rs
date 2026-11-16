@@ -2,10 +2,21 @@ use serde_json::Value;
 use crate::secrets::*;
 
 /// Traefik labels for one service, modelled on what Coolify 4.x generated (see the overview note, spike findings).
-pub(crate) fn labels(stack: &str, svc: &str, domain: &str, port: u16) -> Vec<String> {
+/// `behind`: an outer Traefik already terminates TLS, so only a plain `http` router is rendered (no redirect, no tls).
+pub(crate) fn labels(stack: &str, svc: &str, domain: &str, port: u16, behind: bool) -> Vec<String> {
     let n = |k: &str| format!("{k}-{stack}-{svc}");
     let (h, s) = (n("http"), n("https"));
     let rule = format!("Host(`{domain}`) && PathPrefix(`/`)");
+    if behind {
+        return vec![
+            "traefik.enable=true".into(),
+            "traefik.docker.network=proxy".into(),
+            format!("traefik.http.routers.{h}.entryPoints=http"),
+            format!("traefik.http.routers.{h}.rule={rule}"),
+            format!("traefik.http.routers.{h}.service={h}"),
+            format!("traefik.http.services.{h}.loadbalancer.server.port={port}"),
+        ];
+    }
     vec![
         "traefik.enable=true".into(),
         "traefik.docker.network=proxy".into(),
@@ -47,8 +58,8 @@ pub(crate) fn declarations(env: &Value) -> Vec<Decl> {
     }).collect()
 }
 
-/// Renders `path` for `stack`: writes `.env.generated` next to it and returns the final compose YAML.
-pub(crate) fn render(path: &str, stack: &str) -> String {
+/// Renders `path` for `stack`: writes `.env.generated` next to it and returns the final compose YAML and the stack's domains.
+pub(crate) fn render(path: &str, stack: &str, behind: bool) -> (String, Vec<String>) {
     let text = std::fs::read_to_string(path).unwrap();
     let mut doc: Value = serde_saphyr::from_str(&text).unwrap();
     let mut decls: Vec<(String, Decl)> = vec![];
@@ -65,9 +76,11 @@ pub(crate) fn render(path: &str, stack: &str) -> String {
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&envp).unwrap();
         for (k, v) in &entries { writeln!(f, "{k}={v}").unwrap(); }
     }
+    let mut domains: Vec<String> = vec![];
     for (svc, d) in &decls {
         let dom = entries.iter().find(|(k, _)| *k == d.full).unwrap().1.trim_start_matches("https://").to_string();
-        let ls = labels(stack, svc, &dom, d.port);
+        if !domains.contains(&dom) { domains.push(dom.clone()); }
+        let ls = labels(stack, svc, &dom, d.port, behind);
         let arr = doc["services"][svc].as_object_mut().unwrap().entry("labels").or_insert(Value::Array(vec![]));
         let arr = arr.as_array_mut().expect("map-form labels not handled");
         let existing: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
@@ -77,7 +90,7 @@ pub(crate) fn render(path: &str, stack: &str) -> String {
     set_project_name(&mut doc, stack);
     let proxied: Vec<String> = decls.iter().map(|(s, _)| s.clone()).collect();
     attach_proxy(&mut doc, stack, &proxied);
-    serde_saphyr::to_string(&doc).unwrap()
+    (serde_saphyr::to_string(&doc).unwrap(), domains)
 }
 
 /// Renders every stack dir below `root` in its own process (one failure, e.g. a panic, must not stop the rest).
@@ -175,9 +188,16 @@ mod tests {
 
     #[test]
     fn vaultwarden_matches_coolify() {
-        let got = labels("STACK", "vaultwarden", "vault.schubs.net", 80);
+        let got = labels("STACK", "vaultwarden", "vault.schubs.net", 80, false);
         assert!(got.contains(&"traefik.http.routers.https-STACK-vaultwarden.tls.certresolver=letsencrypt".to_string()));
         assert_eq!(got.len(), 16);
+    }
+
+    #[test]
+    fn behind_proxy_has_no_tls_or_redirect() {
+        let got = labels("S", "a", "a.x.net", 8080, true);
+        assert!(!got.iter().any(|l| l.contains("tls") || l.contains("redirect") || l.contains("https")));
+        assert!(got.contains(&"traefik.http.services.http-S-a.loadbalancer.server.port=8080".to_string()));
     }
 
     #[test]

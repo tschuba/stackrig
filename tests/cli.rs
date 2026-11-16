@@ -219,3 +219,68 @@ fn non_local_host_goes_over_ssh() {
     let l = fs::read_to_string(&log).unwrap();
     assert!(l.starts_with("-o BatchMode=yes me@pi sudo -n docker exec coolify-db"), "{l}");
 }
+
+#[test]
+fn route_derives_everything_from_the_hosts() {
+    let e = Env::new("route");
+    let d = e.stack("app", "services:\n  web:\n    image: x\n    environment:\n      - SERVICE_FQDN_WEB_80=app.example.net\n");
+    let t = e.root.join("proxy");
+    fs::create_dir_all(t.join("dynamic")).unwrap();
+    e.script("sudo", "shift\nexec \"$@\"");
+    e.script("ip", "echo '1.1.1.1 via 192.168.178.1 dev eth0 src 192.168.178.50 uid 1000'");
+    e.script("docker", &format!("case \"$*\" in\n *Mounts*) echo '[{{\"Source\":\"{}\",\"Destination\":\"/traefik\"}}]';;\n *Config.Cmd*) echo '[\"--providers.file.directory=/traefik/dynamic/\"]';;\n *Ports*) echo '{{\"80/tcp\":[{{\"HostIp\":\"0.0.0.0\",\"HostPort\":\"8080\"}}]}}';;\nesac", t.display()));
+    let dir = d.to_str().unwrap();
+    let o = e.run(&["route", dir, "--dry-run"]);
+    let y = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && y.contains("url: 'http://192.168.178.50:8080'") && y.contains("Host(`app.example.net`)"), "{y} {}", String::from_utf8_lossy(&o.stderr));
+    assert!(!t.join("dynamic/stackrig-app.yaml").exists(), "dry run must not write");
+    let o = e.run(&["route", dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(t.join("dynamic/stackrig-app.yaml")).unwrap(), y);
+    // overrides skip the lookups
+    let o = e.run(&["route", dir, "--upstream", "http://10.0.0.9:1", "--dest", t.join("dynamic").to_str().unwrap(), "--resolver", "r2"]);
+    assert!(o.status.success());
+    let f = fs::read_to_string(t.join("dynamic/stackrig-app.yaml")).unwrap();
+    assert!(f.contains("http://10.0.0.9:1") && f.contains("certResolver: r2"));
+}
+
+#[test]
+fn behind_proxy_env_renders_plain_http_labels() {
+    let e = Env::new("behind");
+    let d = e.stack("app", "services:\n  web:\n    image: x\n    environment:\n      - SERVICE_FQDN_WEB_80=app.example.net\n");
+    let run = |v: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_strig"));
+        c.args(["render", d.to_str().unwrap()]);
+        if let Some(v) = v { c.env("STRIG_BEHIND_PROXY", v); }
+        String::from_utf8_lossy(&c.output().unwrap().stdout).into_owned()
+    };
+    assert!(run(None).contains("certresolver"));
+    let y = run(Some("1"));
+    assert!(y.contains("routers.http-app-web.rule") && !y.contains("certresolver") && !y.contains("redirect"), "{y}");
+}
+
+#[test]
+fn inner_proxy_container_switches_labels_and_proxy_up_runs_on_the_host() {
+    let e = Env::new("proxy");
+    let d = e.stack("app", "services:\n  web:\n    image: x\n    environment:\n      - SERVICE_FQDN_WEB_80=app.example.net\n");
+    let log = e.root.join("docker.log");
+    e.script("docker", &format!("echo \"$*\" >> {}\ncase \"$*\" in 'ps -aq'*) echo abc123;; esac\ncat >/dev/null 2>&1 </dev/null", log.display()));
+    let o = e.run(&["render", d.to_str().unwrap()]);
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("certresolver"), "label container must switch the mode");
+    e.script("docker", &format!("echo \"$*\" >> {}\ncat >> {}.stdin", log.display(), log.display()));
+    assert!(String::from_utf8_lossy(&e.run(&["render", d.to_str().unwrap()]).stdout).contains("certresolver"));
+    assert_eq!(e.run(&["proxy", "up"]).status.code(), Some(1), "--trust is required");
+    let o = e.run(&["proxy", "up", "--trust", "10.0.0.2", "--port", "8081"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let sent = fs::read_to_string(format!("{}.stdin", log.display())).unwrap();
+    assert!(sent.contains("stackrig.proxy=true") && sent.contains("'8081:80'") && sent.contains("10.0.0.2/32"), "{sent}");
+}
+
+#[test]
+fn proxy_up_warns_when_the_port_changes() {
+    let e = Env::new("proxyport");
+    e.script("docker", "case \"$*\" in 'inspect'*) echo '{\"80/tcp\":[{\"HostPort\":\"8080\"}]}';; esac\ncat >/dev/null");
+    let err = |a: &[&str]| String::from_utf8_lossy(&e.run(a).stderr).into_owned();
+    assert!(err(&["proxy", "up", "--trust", "10.0.0.2", "--port", "9000"]).contains("port changed 8080 -> 9000"));
+    assert!(!err(&["proxy", "up", "--trust", "10.0.0.2"]).contains("port changed"));
+}

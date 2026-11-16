@@ -24,10 +24,17 @@ pub(crate) fn write_new(path: &std::path::Path, content: &str) -> Result<(), Str
 
 /// Runs a read-only command on `host`: `local` runs it here (CLI on the Pi), anything else goes over ssh.
 /// The commands use `sudo -n`, which fails fast instead of asking for a password.
-pub(crate) fn run_on(host: &str, cmd: &str) -> Result<String, String> {
+pub(crate) fn run_on(host: &str, cmd: &str) -> Result<String, String> { run_on_in(host, cmd, None) }
+
+/// Like `run_on`, with `input` piped to the command's stdin.
+pub(crate) fn run_on_in(host: &str, cmd: &str, input: Option<&str>) -> Result<String, String> {
+    use std::{io::Write, process::Stdio};
     let mut c = if host == "local" { let mut c = std::process::Command::new("sh"); c.args(["-c", cmd]); c }
         else { let mut c = std::process::Command::new("ssh"); c.args(["-o", "BatchMode=yes", host, cmd]); c };
-    let o = c.output().map_err(|e| format!("{host}: {e}"))?;
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut ch = c.spawn().map_err(|e| format!("{host}: {e}"))?;
+    if let Some(i) = input { ch.stdin.take().unwrap().write_all(i.as_bytes()).map_err(|e| format!("{host}: {e}"))?; }
+    let o = ch.wait_with_output().map_err(|e| format!("{host}: {e}"))?;
     if !o.status.success() { return Err(format!("{host} `{cmd}`: {}", String::from_utf8_lossy(&o.stderr).trim())); }
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
