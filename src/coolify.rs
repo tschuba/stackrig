@@ -81,17 +81,30 @@ pub(crate) fn fill_domains(compose: &str, env: &str) -> (String, Vec<String>) {
     (out.join("\n") + "\n", notes)
 }
 
+/// `--only` filter: empty = everything.
+fn pick(list: Vec<(String, String)>, only: &[String]) -> Vec<(String, String)> {
+    list.into_iter().filter(|(_, n)| only.is_empty() || only.contains(n)).collect()
+}
+
+/// A typo in `--only` must not silently migrate nothing.
+fn check_only<'a>(only: &[String], known: impl Iterator<Item = &'a (String, String)>) -> Result<(), String> {
+    let known: Vec<&str> = known.map(|(_, n)| n.as_str()).collect();
+    match only.iter().find(|o| !known.contains(&o.as_str())) { Some(o) => Err(format!("--only {o}: no such Coolify service/application")), None => Ok(()) }
+}
+
 /// Reason `import` writes; `migrate` removes the lock only if it still holds exactly this text (never a hand-made one).
 pub(crate) const IMPORT_LOCK: &str = "import coolify: waiting for `strig migrate coolify` (render/up would create new random values)";
 
 /// `import coolify <host|local> <target-dir>`: writes `docker-compose.yml` (domains filled in) and the user's `.env` per Coolify service.
 /// Reads only; never overwrites. `.env.generated` is left to `migrate`.
-pub(crate) fn import_coolify(host: &str, target: &str) -> Result<String, String> {
+pub(crate) fn import_coolify(host: &str, target: &str, only: &[String]) -> Result<String, String> {
     let mut report = vec![];
+    let (all_apps, all_services) = (coolify_apps(host)?, coolify_services(host)?);
+    check_only(only, all_apps.iter().chain(&all_services))?;
     // Applications first and before anything is written: a copied file may hold state (e.g. OAuth tokens) that a running container keeps rewriting.
     let mut apps = vec![];
     let mut running = vec![];
-    for (uuid, name) in coolify_apps(host)? {
+    for (uuid, name) in pick(all_apps, only) {
         let base = format!("/data/coolify/applications/{uuid}");
         let app = run_on(host, &format!("sudo -n cat {base}/docker-compose.yaml")).and_then(|c| app_stack(&name, &uuid, &c, &run_on(host, &format!("sudo -n cat {base}/.env"))?));
         if app.as_ref().is_ok_and(|a| !a.files.is_empty())
@@ -101,7 +114,7 @@ pub(crate) fn import_coolify(host: &str, target: &str) -> Result<String, String>
     if !running.is_empty() {
         return Err(format!("nothing imported: application(s) {} still running and own files that the container keeps rewriting; stop them in Coolify, then run `import` again", running.join(", ")));
     }
-    for (uuid, name) in coolify_services(host)? {
+    for (uuid, name) in pick(all_services, only) {
         let dir = std::path::Path::new(target).join(&name);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let compose = run_on(host, &format!("sudo -n docker exec coolify-db psql -U coolify -At -c \"select docker_compose_raw from services where name='{name}'\""))?;
@@ -206,12 +219,14 @@ pub(crate) fn bind_sources(yaml: &str) -> Vec<String> {
 /// `migrate coolify <host|local> <target-dir>`: for every service already imported into `<target>/<name>`, writes `.env.generated`
 /// from Coolify's generated values (never overwrites), renders (fills in what Coolify never had), and compares with the running containers.
 /// Reads only on the host and starts nothing. Returns the number of stacks that failed.
-pub(crate) fn migrate_coolify(host: &str, target: &str) -> Result<usize, String> {
+pub(crate) fn migrate_coolify(host: &str, target: &str, only: &[String]) -> Result<usize, String> {
+    let services = coolify_services(host)?;
+    check_only(only, services.iter())?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     // one line per running container: compose project, then the sources of its mounts (shortcut: paths with spaces break this)
     let mounts = run_on(host, "sudo -n docker inspect $(sudo -n docker ps -q) --format '{{index .Config.Labels \"com.docker.compose.project\"}} {{range .Mounts}}{{.Source}} {{end}}'").unwrap_or_default();
     let mut failed = 0;
-    for (uuid, name) in coolify_services(host)? {
+    for (uuid, name) in pick(services, only) {
         let dir = std::path::Path::new(target).join(&name);
         let result = (|| -> Result<(String, Vec<String>), String> {
             if !dir.join("docker-compose.yml").exists() { return Err("no docker-compose.yml, run `import coolify` first".into()); }
@@ -305,5 +320,17 @@ mod tests {
     fn bind_sources_both_forms() {
         let y = "services:\n  a:\n    volumes:\n      - /etc/x:/d\n      - ./rel:/r\n      - data:/v\n      - /var/run/docker.sock:/s\n      - type: bind\n        source: /mnt/y\n        target: /t\n";
         assert_eq!(super::bind_sources(y), ["/etc/x", "/mnt/y"]);
+    }
+}
+
+#[cfg(test)]
+mod only_tests {
+    #[test]
+    fn pick_filters_and_check_only_rejects_unknown() {
+        let l = vec![("1".to_string(), "a".to_string()), ("2".to_string(), "b".to_string())];
+        assert_eq!(super::pick(l.clone(), &["b".into()]), vec![l[1].clone()]);
+        assert_eq!(super::pick(l.clone(), &[]).len(), 2);
+        assert!(super::check_only(&["x".into()], l.iter()).is_err());
+        assert!(super::check_only(&["a".into()], l.iter()).is_ok());
     }
 }
