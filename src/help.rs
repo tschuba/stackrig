@@ -7,6 +7,8 @@ USAGE:
 COMMANDS:
     render      Print the final compose YAML of a stack (writes .env.generated)
     up          Render and start a stack with `docker compose up`
+    proxy       Start/stop the inner Traefik behind Coolify's Traefik
+    route       Make Coolify's Traefik forward a stack's domains to the stack host
     doctor      Check host and stacks for problems
     import      Copy services/applications from a Coolify host
     migrate     Take over generated secrets from a Coolify host
@@ -24,6 +26,7 @@ pub(crate) fn help_for(cmd: &str) -> Option<&'static str> {
 
 Renders the compose file of <dir>: fills SERVICE_URL/FQDN/PASSWORD/... variables, adds Traefik
 labels, the project name and the external network `proxy`. The YAML goes to stdout.
+While an inner Traefik exists (`strig help proxy`) the labels are plain `http` only (no tls/certresolver/redirect).
 Side effect: creates/extends <dir>/.env.generated (mode 600); existing values are never changed.
 
     --all <root>   Render every stack dir below <root>; prints OK/ERROR per stack, exit 1 on any error
@@ -35,6 +38,36 @@ Renders <dir> into docker-compose.generated.yml and runs `docker compose up -d` 
 --env-file .env (if present) and .env.generated.
 Extra arguments replace the default `-d` and are passed to `docker compose up`.
 Refused if <dir>/.lock exists.",
+        "proxy" => "strig proxy up --trust <ip> [--port 8080] [--to <host>] [--dry-run]
+strig proxy down [--to <host>]
+
+up    Creates network `proxy` if missing and starts the inner Traefik `stackrig-proxy` (label stackrig.proxy=true)
+      that routes the stacks by their labels on plain http, published on --port (default 8080). Run it again to update it.
+down  Removes the container.
+
+    --trust <ip>  Address Coolify's Traefik connects from (seen by the inner one); only it may set X-Forwarded-*. Required.
+    --to <host>   Stack host (user@host over ssh, or `local`, default). Needs docker there.
+    --dry-run     Print the compose file only
+
+While a container with that label exists (running or not), `render`/`up` emit plain http labels (no TLS, no redirect)
+because Coolify's Traefik terminates TLS. STRIG_BEHIND_PROXY=1|0 forces the mode. Then: `strig route`.",
+        "route" => "strig route <dir> [--from <host>] [--to <host>] [--upstream <url>] [--dest <path>] [--resolver <name>] [--dry-run]
+
+Makes Coolify's Traefik forward the domains of the stack in <dir> to a stack host, by writing
+<dest>/stackrig-<stack>.yaml (one file per stack, entryPoint https, certResolver letsencrypt) on the Coolify host.
+Coolify's Traefik reloads it by itself. Use together with STRIG_BEHIND_PROXY=1 and an inner Traefik (see README).
+
+    <dir>        Stack directory here (compose file; the domains come from its SERVICE_URL/FQDN)
+    --from <h>   Coolify host (user@host over ssh, or `local`, default): the file is written THERE (`sudo -n tee`);
+                 the directory is read from the coolify-proxy container
+    --to <h>     Stack host (default `local`): the inner Traefik is the container with label stackrig.proxy=true,
+                 its published port and this host's address (Linux `ip`) become the upstream
+    --upstream   Use this URL (e.g. http://192.168.178.50:8080) instead of looking it up on --to
+    --dest       Use this directory on --from instead of the one coolify-proxy reads
+    --resolver   certResolver name (default letsencrypt)
+    --dry-run    Print the config, write nothing
+
+Refused if <dir>/.lock exists. Writes .env.generated like `render`.",
         "doctor" => "strig doctor [fix] [<dir> | --all <root>]
 
 Checks: Docker and Compose reachable, network `proxy`. With a dir: renders a temp copy and reports

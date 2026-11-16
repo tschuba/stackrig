@@ -1,10 +1,12 @@
 mod coolify;
 mod doctor;
 mod help;
+mod proxy;
 mod render;
+mod route;
 mod secrets;
 
-use crate::{coolify::*, doctor::*, help::*, render::*};
+use crate::{coolify::*, doctor::*, help::*, proxy::*, render::*, route::*};
 
 /// A stack dir with this file is refused by render/up; the file's text is the reason. Also usable by hand.
 const LOCK: &str = ".lock";
@@ -22,9 +24,16 @@ fn main() {
         only = v.split(',').filter(|n| !n.is_empty()).map(String::from).collect();
         a.drain(i..=i + 1);
     }
+    let ro = if a.get(1).map(String::as_str) == Some("route") {
+        RouteOpts { from: take_opt(&mut a, "--from"), to: take_opt(&mut a, "--to"), upstream: take_opt(&mut a, "--upstream"),
+            dest: take_opt(&mut a, "--dest"), resolver: take_opt(&mut a, "--resolver"), dry }
+    } else { RouteOpts::default() };
     if a.get(1).map(String::as_str) == Some("render") && a.get(2).map(String::as_str) == Some("--all") {
         let Some(root) = a.get(3) else { eprintln!("usage: strig render --all <root>   (see `strig help render`)"); exit(2) };
         exit(render_all(root));
+    }
+    if a.get(1).map(String::as_str) == Some("proxy") {
+        match proxy(&mut a, dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(if e.starts_with("usage") { 2 } else { 1 }) } }
     }
     if a.get(1).map(String::as_str) == Some("doctor") { exit(doctor(&a[2..])); }
     if let (Some(cmd @ ("import" | "migrate")), Some("coolify"), Some(h), Some(d)) = (a.get(1).map(String::as_str), a.get(2).map(String::as_str), a.get(3), a.get(4)) {
@@ -42,7 +51,7 @@ fn main() {
         eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--only a,b] [--dry-run]   (see `strig help import`)"); exit(2)
     }
     let usage = || -> ! { eprintln!("{HELP}"); exit(2) };
-    let (cmd, dir) = match (a.get(1).map(String::as_str), a.get(2)) { (Some(c @ ("render" | "up")), Some(d)) => (c, std::path::Path::new(d)), _ => usage() };
+    let (cmd, dir) = match (a.get(1).map(String::as_str), a.get(2)) { (Some(c @ ("render" | "up" | "route")), Some(d)) => (c, std::path::Path::new(d)), _ => usage() };
     let dir = dir.canonicalize().unwrap_or_else(|e| { eprintln!("{}: {e}", dir.display()); exit(1) });
     if let Ok(reason) = std::fs::read_to_string(dir.join(LOCK)) {
         eprintln!("error: {} is locked ({LOCK}): {}", dir.display(), reason.trim()); exit(1)
@@ -50,7 +59,10 @@ fn main() {
     let stack = dir.file_name().unwrap().to_string_lossy().to_lowercase();
     let src = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"].iter().map(|f| dir.join(f)).find(|p| p.exists())
         .unwrap_or_else(|| { eprintln!("no compose file in {}", dir.display()); exit(1) });
-    let out = render(src.to_str().unwrap(), &stack);
+    let (out, domains) = render(src.to_str().unwrap(), &stack, cmd != "route" && behind_proxy());
+    if cmd == "route" {
+        match route(&stack, &domains, &ro) { Ok(()) => return, Err(e) => { eprintln!("error: {e}"); exit(1) } }
+    }
     if cmd == "render" { print!("{out}"); return; }
     // `up`: hand the rendered file and both env files to compose (forgetting an --env-file would start with empty secrets)
     let genf = dir.join("docker-compose.generated.yml");

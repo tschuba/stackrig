@@ -2,6 +2,16 @@
 
 CLI that runs Coolify-generated compose stacks without Coolify. See `strig help`.
 
+## Stacks behind Coolify's Traefik (inner Traefik)
+
+Run strig stacks on another host (or next to Coolify) and let Coolify's Traefik forward their domains to one inner Traefik.
+On the stack host (or with `--to <host>`) run `strig proxy up --trust <coolify-ip>`: it starts the inner Traefik on port 8080
+(label `stackrig.proxy=true`; `--trust` = address Coolify's Traefik connects from, so `X-Forwarded-Proto` survives).
+While that container exists, `render`/`up` emit one plain `http` router per service (no TLS, certresolver or redirect:
+Coolify's Traefik terminates TLS); `STRIG_BEHIND_PROXY=1|0` forces the mode. Untested against a real setup.
+
+Then `strig route <stack-dir> --from <coolify-host> --to <stack-host>` writes `stackrig-<stack>.yaml` into Coolify's Traefik (see `strig help route`).
+
 ## Releases
 
 Versioning is automated with [release-please](https://github.com/googleapis/release-please).
