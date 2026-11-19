@@ -1,12 +1,13 @@
 mod coolify;
 mod doctor;
 mod help;
+mod mv;
 mod proxy;
 mod render;
 mod route;
 mod secrets;
 
-use crate::{coolify::*, doctor::*, help::*, proxy::*, render::*, route::*};
+use crate::{coolify::*, doctor::*, help::*, mv::*, proxy::*, render::*, route::*};
 
 /// A stack dir with this file is refused by render/up; the file's text is the reason. Also usable by hand.
 const LOCK: &str = ".lock";
@@ -34,6 +35,14 @@ fn main() {
     }
     if a.get(1).map(String::as_str) == Some("proxy") {
         match proxy(&mut a, dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(if e.starts_with("usage") { 2 } else { 1 }) } }
+    }
+    if a.get(1).map(String::as_str) == Some("move") {
+        let (from, trust) = (take_opt(&mut a, "--from"), take_opt(&mut a, "--trust"));
+        let stop = a.iter().position(|x| x == "--stop").map(|i| a.remove(i)).is_some();
+        let (Some("coolify"), Some(n), Some(d)) = (a.get(2).map(String::as_str), a.get(3), a.get(4)) else {
+            eprintln!("usage: strig move coolify <name> <target-dir> [--from <host>] [--stop] [--trust <ip>] [--dry-run]   (see `strig help move`)"); exit(2)
+        };
+        match move_coolify(n, d, from.as_deref().unwrap_or("local"), stop, trust.as_deref(), dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(1) } }
     }
     if a.get(1).map(String::as_str) == Some("doctor") { exit(doctor(&a[2..])); }
     if let (Some(cmd @ ("import" | "migrate")), Some("coolify"), Some(h), Some(d)) = (a.get(1).map(String::as_str), a.get(2).map(String::as_str), a.get(3), a.get(4)) {

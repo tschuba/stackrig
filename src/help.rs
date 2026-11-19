@@ -12,6 +12,7 @@ COMMANDS:
     doctor      Check host and stacks for problems
     import      Copy services/applications from a Coolify host
     migrate     Take over generated secrets from a Coolify host
+    move        Move one Coolify service/application here in one go (data, up, route)
     help        Show help for a command: `strig help <command>`
 
 OPTIONS:
@@ -91,6 +92,19 @@ Exit code 1 if errors remain (warnings do not count).",
     --dry-run   Run the real code on a throw-away copy; nothing below <target-dir> changes
 
 Exit code 1 on errors (and for migrate when stacks need attention).",
+        "move" => "strig move coolify <name> <target-dir> [--from <host|local>] [--stop] [--trust <ip>] [--dry-run]
+
+Runs on the stack host (here). Steps: stop the Coolify containers (--stop), start the inner Traefik if missing (--trust),
+import + migrate into <target-dir>/<name>, copy named volumes into <stack>_<volume>, `up`, `route` into Coolify's Traefik.
+
+    --from <h>    Coolify host (user@host, or `local` = same host, default)
+    --stop        Stop the running Coolify containers; without it a running app aborts the move
+    --trust <ip>  Needed only if no inner Traefik exists yet (see `strig help proxy`)
+    --dry-run     Print the plan, change nothing
+
+Coolify's containers stay stopped (not removed): to roll back, `docker compose down` here, delete
+stackrig-<stack>.yaml in Coolify's Traefik dir, `docker start` the containers. Afterwards disable the app in Coolify,
+or a redeploy there starts it again. Services: volumes are expected as `<uuid>_<key>`.",
         _ => return None,
     })
 }
