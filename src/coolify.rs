@@ -153,6 +153,11 @@ pub(crate) fn import_coolify(host: &str, target: &str, only: &[String]) -> Resul
     Ok(report.join("\n"))
 }
 
+/// Compose volume key of a Coolify volume: `<uuid>_data` / `<uuid>-data` -> `data`, anything else unchanged.
+pub(crate) fn vol_key<'a>(name: &'a str, uuid: &str) -> &'a str {
+    name.strip_prefix(uuid).and_then(|r| r.strip_prefix(['_', '-'])).filter(|k| !k.is_empty()).unwrap_or(name)
+}
+
 /// What `import` makes of one Coolify application (its generated `docker-compose.yaml` is the source, the DB columns can be stale).
 #[derive(Debug)]
 pub(crate) struct AppStack { yaml: String, user_env: Vec<String>, files: Vec<(String, String)>, notes: Vec<String> }
@@ -179,11 +184,18 @@ pub(crate) fn app_stack(name: &str, uuid: &str, compose: &str, env: &str) -> Res
     let mut env_decl = vec![];
     if let Some(h) = hosts.first() { env_decl.push(format!("SERVICE_FQDN_{}_{}={h}", norm(name), port.unwrap_or(80))); }
     let prefix = format!("/data/coolify/applications/{uuid}/");
-    let (mut volumes, mut files) = (vec![], vec![]);
+    let (mut volumes, mut files, mut named) = (vec![], vec![], vec![]);
     for v in svc["volumes"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
         match v.split_once(':').and_then(|(src, rest)| Some((src.strip_prefix(&prefix)?, rest))) {
             Some((rel, rest)) if rel.chars().all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c)) && !rel.contains("..") => {
                 files.push((format!("{prefix}{rel}"), rel.to_string())); volumes.push(format!("./{rel}:{rest}")) }
+            // named volume: declared at top level under its Coolify-less key; `move` copies the data into `<stack>_<key>`
+            None if v.split_once(':').is_some_and(|(s, _)| !s.is_empty() && !s.starts_with(['/', '.', '~'])) => {
+                let (src, rest) = v.split_once(':').unwrap();
+                let key = vol_key(src, uuid);
+                volumes.push(format!("{key}:{rest}"));
+                if !named.contains(&key.to_string()) { named.push(key.to_string()); }
+            }
             _ => { notes.push(format!("volume kept as is: {v}")); volumes.push(v.into()) }
         }
     }
@@ -192,7 +204,9 @@ pub(crate) fn app_stack(name: &str, uuid: &str, compose: &str, env: &str) -> Res
     if !user_env.is_empty() { out["env_file"] = serde_json::json!([".env"]); }
     if !env_decl.is_empty() { out["environment"] = env_decl.into(); }
     if !volumes.is_empty() { out["volumes"] = volumes.into(); }
-    let yaml = serde_saphyr::to_string(&serde_json::json!({ "services": { name: out } })).map_err(|e| e.to_string())?;
+    let mut doc = serde_json::json!({ "services": { name: out } });
+    if !named.is_empty() { doc["volumes"] = named.iter().map(|k| (k.clone(), serde_json::json!({}))).collect::<serde_json::Map<_, _>>().into(); }
+    let yaml = serde_saphyr::to_string(&doc).map_err(|e| e.to_string())?;
     Ok(AppStack { yaml, user_env, files, notes })
 }
 
@@ -282,6 +296,14 @@ mod tests {
         assert_eq!(a.files, vec![("/data/coolify/applications/U/app/c.json".to_string(), "app/c.json".to_string())]);
         for want in ["SERVICE_FQDN_MINIQR_8080=qr.example.net", "./app/c.json:/app/c.json", "/other:/o", "env_file"] { assert!(a.yaml.contains(want), "{want} in {}", a.yaml); }
         assert!(!a.yaml.contains("coolify"));
+    }
+
+    #[test]
+    fn named_volumes_are_declared_and_keyed() {
+        let c = "services:\n  x:\n    image: i\n    volumes:\n      - 'U-data:/d'\n";
+        let a = super::app_stack("a", "U", c, "").unwrap();
+        assert!(a.yaml.contains("data:/d") && !a.yaml.contains("U-data"), "{}", a.yaml);
+        assert_eq!((super::vol_key("U_x", "U"), super::vol_key("other", "U")), ("x", "other"));
     }
 
     #[test]
