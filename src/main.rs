@@ -48,7 +48,6 @@ fn main() {
     }
     match a.get(1).map(String::as_str) {
         Some("ls") => exit(ops::ls(&a[2..]).map_or_else(|e| { eprintln!("error: {e}"); 1 }, |_| 0)),
-        Some("domains") => exit(ops::domains(&a[2..]).map_or_else(|e| { eprintln!("error: {e}"); 1 }, |_| 0)),
         Some("drift") => exit(ops::drift().map_or_else(|e| { eprintln!("error: {e}"); 2 }, |n| (n > 0) as i32)),
         Some("update") => exit(update::update(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
         Some("deploy") => exit(ops::deploy(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),

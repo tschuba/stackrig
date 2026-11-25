@@ -1,4 +1,4 @@
-//! Read-only inventory (`ls`, `domains`, `drift`) and the `deploy` wrapper for the homelab repo (Git = target state, hosts = actual state).
+//! Read-only inventory (`ls`, `drift`) and the `deploy` wrapper for the homelab repo (Git = target state, hosts = actual state).
 use crate::coolify::run_on;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -71,7 +71,7 @@ fn table(rows: Vec<Vec<String>>) {
     for r in rows { println!("{}", r.iter().zip(&w).map(|(c, w)| format!("{c:w$}")).collect::<Vec<_>>().join("  ").trim_end()); }
 }
 
-/// `[<stack>...] [--host <host>...]` filter shared by ls and domains: stacks OR-ed, hosts OR-ed, both AND-ed.
+/// `[<stack>...] [--host <host>...]` filter of ls: stacks OR-ed, hosts OR-ed, both AND-ed.
 /// Every unknown stack/host, or a stack not on the given hosts, is an error (nothing is printed).
 fn filtered(cmd: &str, a: &[String]) -> Result<(Vec<Stack>, BTreeMap<String, String>), String> {
     let usage = || format!("usage: strig {cmd} [<stack>...] [--host <host>...]");
@@ -96,14 +96,14 @@ fn filtered(cmd: &str, a: &[String]) -> Result<(Vec<Stack>, BTreeMap<String, Str
 }
 
 pub(crate) fn ls(a: &[String]) -> Result<(), String> {
-    const COLS: [&str; 7] = ["stack", "host", "state", "service", "image", "tag", "domains"];
-    let usage = || "usage: strig ls [<stack>...] [--host <host>...] [--show <stack,host,state,service,image,tag,domains>]".to_string();
+    const COLS: [&str; 8] = ["stack", "host", "state", "service", "image", "tag", "domains", "auth"];
+    let usage = || "usage: strig ls [<stack>...] [--host <host>...] [--show <stack,host,state,service,image,tag,domains,auth>]".to_string();
     let (mut cols, mut rest, mut it) = (None, vec![], a.iter());
     while let Some(x) = it.next() {
         if x == "--show" { if cols.replace(it.next().ok_or_else(usage)?).is_some() { return Err(usage()); } } else { rest.push(x.clone()); }
     }
     let shown = cols.is_some();
-    let cols: Vec<&str> = cols.map_or(COLS.to_vec(), |c| c.split(',').collect());
+    let cols: Vec<&str> = cols.map_or(COLS[..7].to_vec(), |c| c.split(',').collect());
     if let Some(c) = cols.iter().find(|c| !COLS.contains(c)) { return Err(format!("unknown column `{c}` (one of: {})", COLS.join(", "))); }
     let (stacks, ssh) = filtered("ls", &rest)?;
     // `name:tag` -> (name, tag); the first `:` after the last `/` splits (an earlier one is a registry port, a later one is inside `${VAR:-x}`)
@@ -126,6 +126,7 @@ pub(crate) fn ls(a: &[String]) -> Result<(), String> {
         for (svc, img, dom) in &lines {
             data.push(cols.iter().map(|c| match *c {
                 "domains" => dom.clone(),
+                "auth" => if dom.is_empty() { String::new() } else if s.auth.contains(dom) { "yes".into() } else { "no".into() },
                 "service" => svc.clone(),
                 "image" => split(img).0,
                 "tag" => split(img).1,
@@ -149,16 +150,6 @@ pub(crate) fn ls(a: &[String]) -> Result<(), String> {
         prev = Some(orig);
         if !dup { rows.push(r); }
     }
-    table(rows);
-    Ok(())
-}
-
-pub(crate) fn domains(a: &[String]) -> Result<(), String> {
-    let (stacks, _) = filtered("domains", a)?;
-    let mut rows = vec![["DOMAIN", "STACK", "HOST", "AUTH"].map(String::from).to_vec()];
-    let mut all: Vec<_> = stacks.iter().flat_map(|s| s.domains.iter().map(move |d| (d, s))).collect();
-    all.sort_by_key(|(d, _)| d.as_str());
-    for (d, s) in all { rows.push(vec![d.clone(), s.name.clone(), s.host.clone(), if s.auth.contains(d) { "yes" } else { "no" }.into()]); }
     table(rows);
     Ok(())
 }

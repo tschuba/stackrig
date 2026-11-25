@@ -65,16 +65,16 @@ fn interactive_rejects_check_and_pin() {
 }
 
 #[test]
-fn domains_filters_by_stack_and_host() {
-    let e = Env::new("domains");
+fn ls_filters_and_rejects_bad_input() {
+    let e = Env::new("lsfilter");
     fs::write(e.root.join("stacks/a/meta.yml"), "domains: [a.example.org]\n").unwrap();
     let run = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_strig")).args(args).env("STRIG_HOME", &e.root).output().unwrap();
-    for (args, code) in [(&["domains", "a"][..], 0), (&["domains", "--host", "pi"], 0), (&["domains", "nope"], 1), (&["domains", "--host", "x"], 1), (&["domains", "--bogus"], 1), (&["ls", "nope"], 1), (&["domains", "a", "nope"], 1), (&["domains", "a", "a"], 0), (&["domains", "--host", "pi", "--host", "pi"], 0), (&["ls", "--host", "x"], 1), (&["ls", "--bogus"], 1), (&["ls", "--show", "nope"], 1), (&["ls", "--show"], 1), (&["ls", "--show", "image", "--show", "image"], 1), (&["ls", "--show", "stack,service,image,tag,domains"], 0)] {
+    for (args, code) in [(&["ls", "a", "--show", "domains"][..], 0), (&["ls", "--host", "pi", "--show", "stack"], 0), (&["ls", "nope"], 1), (&["ls", "a", "nope"], 1), (&["ls", "a", "a", "--show", "stack"], 0), (&["ls", "--host", "pi", "--host", "pi", "--show", "stack"], 0), (&["ls", "--host", "x"], 1), (&["ls", "--bogus"], 1), (&["ls", "--show", "nope"], 1), (&["ls", "--show"], 1), (&["ls", "--show", "image", "--show", "image"], 1), (&["ls", "--show", "stack,service,image,tag,domains,auth"], 0), (&["domains"], 2)] {
         let o = run(args);
         assert_eq!(o.status.code(), Some(code), "{args:?}: {}", err(&o));
     }
-    assert!(String::from_utf8_lossy(&run(&["domains", "a"]).stdout).contains("a.example.org"));
-    let o = run(&["ls", "--show", "domains,stack"]);
+    assert!(String::from_utf8_lossy(&run(&["ls", "a", "--show", "domains"]).stdout).contains("a.example.org"));
+    let o = run(&["ls", "--show", "domains,auth"]);
     assert!(String::from_utf8_lossy(&o.stdout).starts_with("DOMAINS"), "{}", err(&o));
 }
 
