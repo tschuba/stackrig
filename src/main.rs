@@ -2,10 +2,12 @@ mod coolify;
 mod doctor;
 mod help;
 mod mv;
+mod ops;
 mod proxy;
 mod render;
 mod route;
 mod secrets;
+mod update;
 
 use crate::{coolify::*, doctor::*, help::*, mv::*, proxy::*, render::*, route::*};
 
@@ -43,6 +45,13 @@ fn main() {
             eprintln!("usage: strig move coolify <name> <target-dir> [--from <host>] [--stop] [--trust <ip>] [--dry-run]   (see `strig help move`)"); exit(2)
         };
         match move_coolify(n, d, from.as_deref().unwrap_or("local"), stop, trust.as_deref(), dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(1) } }
+    }
+    match a.get(1).map(String::as_str) {
+        Some("ls") => exit(ops::ls(&a[2..]).map_or_else(|e| { eprintln!("error: {e}"); 1 }, |_| 0)),
+        Some("drift") => exit(ops::drift().map_or_else(|e| { eprintln!("error: {e}"); 2 }, |n| (n > 0) as i32)),
+        Some("update") => exit(update::update(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
+        Some("deploy") => exit(ops::deploy(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
+        _ => {}
     }
     if a.get(1).map(String::as_str) == Some("doctor") { exit(doctor(&a[2..])); }
     if let (Some(cmd @ ("import" | "migrate")), Some("coolify"), Some(h), Some(d)) = (a.get(1).map(String::as_str), a.get(2).map(String::as_str), a.get(3), a.get(4)) {

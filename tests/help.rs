@@ -4,7 +4,7 @@ fn strig(args: &[&str]) -> Output { Command::new(env!("CARGO_BIN_EXE_strig")).ar
 fn out(o: &Output) -> String { String::from_utf8_lossy(&o.stdout).into_owned() }
 fn err(o: &Output) -> String { String::from_utf8_lossy(&o.stderr).into_owned() }
 
-const CMDS: [&str; 7] = ["render", "up", "proxy", "route", "doctor", "import", "migrate"];
+const CMDS: [&str; 11] = ["render", "up", "proxy", "route", "doctor", "import", "migrate", "ls", "drift", "deploy", "update"];
 
 #[test]
 fn overview_lists_all_commands() {
