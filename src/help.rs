@@ -157,10 +157,11 @@ Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a war
                        Images with `${VAR}` are listed as `skipped (variable)` and never changed or pulled; a downgrade (typed tag older than current) is not reported.
 
 Registry access: `crane` if installed, else curl (+ `docker buildx imagetools` for digests). Run in the homelab repo or set STRIG_HOME.",
-        "deploy" => "strig deploy <stack> | --host <host> [ansible-playbook flags]
+        "deploy" => "strig deploy <stack> | --host <host> [--pull] [ansible-playbook flags]
 
 Runs `ansible-playbook site.yml --limit <host> [-e only=<stack>]` in the homelab repo (or STRIG_HOME).
-The host comes from host_vars. Extra flags go to Ansible, e.g. `strig deploy beszel --check --diff`.",
+The host comes from host_vars. Extra flags go to Ansible, e.g. `strig deploy beszel --check --diff`.
+--pull    Always pull images (`-e pull_always=true`), so a newer `latest` is fetched. Pinned digests stay: use `strig update`.",
         _ => return None,
     })
 }

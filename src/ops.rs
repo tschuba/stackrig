@@ -181,7 +181,7 @@ pub(crate) fn drift() -> Result<usize, String> {
 
 /// `strig deploy <stack>|--host <host> [ansible-playbook flags]`: the only deploy path stays Ansible.
 pub(crate) fn deploy(a: &[String]) -> Result<i32, String> {
-    let usage = || "usage: strig deploy <stack> | --host <host>  [ansible flags, e.g. --check --diff]".to_string();
+    let usage = || "usage: strig deploy <stack> | --host <host>  [--pull] [ansible flags, e.g. --check --diff]".to_string();
     let (host, only, rest) = match a.first().map(String::as_str) {
         Some("--host") => (a.get(1).ok_or_else(usage)?.clone(), None, &a[2..]),
         Some(n) if !n.starts_with('-') => (load(&root())?.0.iter().find(|s| s.name == n).ok_or(format!("unknown stack `{n}` (not in any host_vars)"))?.host.clone(), Some(n), &a[1..]),
@@ -190,7 +190,8 @@ pub(crate) fn deploy(a: &[String]) -> Result<i32, String> {
     let mut c = std::process::Command::new("ansible-playbook");
     c.current_dir(root()).args(["site.yml", "--limit", &host]);
     if let Some(n) = only { c.arg("-e").arg(format!("only={n}")); }
-    Ok(c.args(rest).status().map_err(|e| format!("ansible-playbook: {e}"))?.code().unwrap_or(1))
+    if rest.iter().any(|f| f == "--pull") { c.args(["-e", "pull_always=true"]); }
+    Ok(c.args(rest.iter().filter(|f| *f != "--pull")).status().map_err(|e| format!("ansible-playbook: {e}"))?.code().unwrap_or(1))
 }
 
 #[cfg(test)]
