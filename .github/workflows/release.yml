@@ -56,9 +56,13 @@ jobs:
           TAG: ${{ needs.release-please.outputs.tag }}
           REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           v=${TAG#v}
           base="https://github.com/$REPO/releases/download/$TAG/strig-$v"
           sha() { gh release download "$TAG" -R "$REPO" -p "strig-$v-$1.tar.gz" -O - | sha256sum | cut -d' ' -f1; }
+          # computed before the heredoc: failures inside $(...) there would be swallowed (empty-input hash)
+          mac_arm=$(sha aarch64-apple-darwin); mac_x64=$(sha x86_64-apple-darwin)
+          lin_arm=$(sha aarch64-unknown-linux-musl); lin_x64=$(sha x86_64-unknown-linux-musl)
           mkdir -p Formula
           cat > Formula/stackrig.rb <<EOF
           class Stackrig < Formula
@@ -69,21 +73,21 @@ jobs:
             on_macos do
               on_arm do
                 url "$base-aarch64-apple-darwin.tar.gz"
-                sha256 "$(sha aarch64-apple-darwin)"
+                sha256 "$mac_arm"
               end
               on_intel do
                 url "$base-x86_64-apple-darwin.tar.gz"
-                sha256 "$(sha x86_64-apple-darwin)"
+                sha256 "$mac_x64"
               end
             end
             on_linux do
               on_arm do
                 url "$base-aarch64-unknown-linux-musl.tar.gz"
-                sha256 "$(sha aarch64-unknown-linux-musl)"
+                sha256 "$lin_arm"
               end
               on_intel do
                 url "$base-x86_64-unknown-linux-musl.tar.gz"
-                sha256 "$(sha x86_64-unknown-linux-musl)"
+                sha256 "$lin_x64"
               end
             end
 
