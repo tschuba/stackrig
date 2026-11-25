@@ -139,12 +139,14 @@ Compares Git with what runs on each host; prints one line per finding, or `no dr
     differs   ~/homelab/stacks/<n>/compose.yml on the host is missing or != compose.yml in Git (only compose.yml is compared)
 
 Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a warning.",
-        "update" => "strig update [-i|--interactive] [--major] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
+        "update" => "strig update [-i|--interactive] [--major] [--service <name>...] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
 
     --check            Show newer tags (same format: prefix, suffix, number of parts) and the registry digest of `latest`. Writes nothing.
     -i, --interactive  Interactive (plain update only): per image `Y` apply, `n` keep, a tag to use that version instead (checked in
                        the registry), `q` abort (nothing written). Images without a newer tag can be changed by typing a tag, too.
                        Afterwards asks before deploying. Prompts go to stderr.
+    --service <name>   Only this service of <stack> (repeatable; not with --all). Edits, pulls and checks only its image;
+                       the deploy and the health check still cover the whole stack (compose restarts only what changed).
     --major            Also take major jumps. Default: stay in the same major (for 0.x the first non-zero part counts: 0.21.x stays 0.21.x);
                        a higher one is only shown as `(major available: ...)`.
     --pin              Rewrite `latest`/untagged images to repo:<tag>@sha256:<digest> (tag found by digest among the 20 newest
@@ -152,7 +154,7 @@ Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a war
     <stack>|--all      Bump fixed tags to the newest one in compose.yml, `docker pull` all images on the host, `strig deploy`
                        (Ansible), then wait up to 120 s for health: Docker healthcheck, else running without restarts.
                        Exit 1 on failure; no automatic rollback (git revert + `strig deploy`). No backup yet.
-                       Images with `${VAR}` are skipped; a downgrade (typed tag older than current) is not reported.
+                       Images with `${VAR}` are listed as `skipped (variable)` and never changed or pulled; a downgrade (typed tag older than current) is not reported.
 
 Registry access: `crane` if installed, else curl (+ `docker buildx imagetools` for digests). Run in the homelab repo or set STRIG_HOME.",
         "deploy" => "strig deploy <stack> | --host <host> [ansible-playbook flags]

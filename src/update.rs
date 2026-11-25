@@ -142,13 +142,24 @@ fn resolve(img: &str, mode: Mode, major: bool) -> Result<(Option<String>, String
     }
 }
 
-/// Calls `f` for every `image:` value (variables skipped); `Some` replaces it. Everything else in the file stays byte-identical.
-fn map_images(text: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+/// Calls `f(service, image)` for every `image:` value (also ones with `${VAR}`: the caller decides); `Some` replaces it. Everything else stays byte-identical.
+/// shortcut: the service is the key one indent level below `services:`, found line by line (no YAML parse, so anchors/merge keys are not followed).
+fn map_images(text: &str, mut f: impl FnMut(&str, &str) -> Option<String>) -> String {
+    let (mut in_svcs, mut svc_indent, mut svc) = (false, None::<usize>, String::new());
     text.split_inclusive('\n').map(|l| {
-        let Some(rest) = l.trim_start().strip_prefix("image:") else { return l.to_string() };
+        let t = l.trim_start();
+        let indent = l.len() - t.len();
+        if !t.is_empty() && !t.starts_with('#') {
+            if indent == 0 { in_svcs = t.trim_end() == "services:"; svc_indent = None; svc.clear(); }
+            else if in_svcs {
+                if svc_indent.is_none() { svc_indent = Some(indent); }
+                if Some(indent) == svc_indent { if let Some((k, _)) = t.split_once(':') { svc = k.trim_matches(['"', '\'']).to_string(); } }
+            }
+        }
+        let Some(rest) = t.strip_prefix("image:") else { return l.to_string() };
         let Some(v) = rest.split_whitespace().next().map(|v| v.trim_matches(['"', '\''])) else { return l.to_string() };
-        if v.is_empty() || v.contains('$') { return l.to_string(); }
-        f(v).map_or(l.to_string(), |n| l.replacen(v, &n, 1))
+        if v.is_empty() { return l.to_string(); }
+        f(&svc, v).map_or(l.to_string(), |n| l.replacen(v, &n, 1))
     }).collect()
 }
 
@@ -164,12 +175,12 @@ fn ask(prompt: &str) -> String {
     l.trim().to_string()
 }
 
-/// Asks about one image. `proposal` is the new ref `resolve` suggests (if any). Returns the new ref, `None` to keep, or Err(()) to quit.
+/// Asks about one image (`who` = stack and service label). `proposal` is the new ref `resolve` suggests (if any). Returns the new ref, `None` to keep, or Err(()) to quit.
 /// Any other input is taken as a tag and checked against the registry.
-fn choose(stack: &str, img: &str, proposal: Option<&str>, note: &str) -> Result<Option<String>, ()> {
+fn choose(who: &str, img: &str, proposal: Option<&str>, note: &str) -> Result<Option<String>, ()> {
     let (repo, _, dig) = split_ref(img);
     loop {
-        eprintln!("{stack:14} {img}  {note}");
+        eprintln!("{who} {img}  {note}");
         let a = ask(&match proposal { Some(p) => format!("  apply {p}? [Y]es / [n]o / <tag> / [q]uit: "), None => "  [Enter] keep / <tag> / [q]uit: ".to_string() });
         match a.as_str() {
             "q" | "Q" => return Err(()),
@@ -211,7 +222,11 @@ fn health(t: &str, n: &str, min: u64, max: u64, poll: u64) -> Result<(), String>
 // ---- command ----
 
 pub(crate) fn update(a: &[String]) -> Result<i32, String> {
-    let usage = || "usage: strig update [-i] [--major] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all".to_string();
+    let usage = || "usage: strig update [-i] [--major] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all   (<stack> [--service <name>...] limits it to some services)".to_string();
+    // `--service <name>` (repeatable) is taken out first so its value is not mistaken for the stack
+    let (mut svcs, mut rest, mut it) = (vec![], vec![], a.iter());
+    while let Some(x) = it.next() { if x == "--service" { svcs.push(it.next().ok_or_else(usage)?.clone()); } else { rest.push(x.clone()); } }
+    let a = &rest[..];
     let has = |f: &str| a.iter().any(|x| x == f);
     let mode = if has("--check") { Mode::Check } else if has("--pin") { Mode::Pin } else { Mode::Update };
     let inter = has("-i") || has("--interactive");
@@ -222,6 +237,11 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
     let (stacks, ssh) = ops::load(&root)?;
     let targets: Vec<_> = stacks.iter().filter(|s| name.is_none_or(|n| *n == s.name)).collect();
     if targets.is_empty() { return Err(format!("unknown stack `{}`", name.unwrap())); }
+    if !svcs.is_empty() {
+        let Some(n) = name.filter(|_| !has("--all")) else { return Err("--service needs exactly one <stack> (not --all)".into()) };
+        if let Some(bad) = svcs.iter().find(|v| !targets[0].services.iter().any(|(sv, _, _)| sv == *v)) { return Err(format!("stack `{n}` has no service `{bad}` with an image")); }
+    }
+    let want = |sv: &str| svcs.is_empty() || svcs.iter().any(|x| x == sv);
     let mut rc = 0;
     for s in targets {
         let dir = root.join("stacks").join(&s.name);
@@ -229,12 +249,19 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
         let mut errs = 0;
         let mut quit = false;
-        let new = map_images(&text, |img| {
-            if quit { return None; }
+        let (mut w, mut wi) = (7, 5); // service column gets +1 below so names never touch the image
+        map_images(&text, |sv, i| { if want(sv) { w = w.max(sv.len() + 1); wi = wi.max(i.len()); } None });
+        let mut header = inter;
+        let new = map_images(&text, |sv, img| {
+            if quit || !want(sv) { return None; }
+            let who = format!("{:14} {sv:w$}", s.name);
+            if !header { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); }
+            // the version is set by a variable (.env / Ansible), so it is not ours to rewrite
+            if img.contains('$') { let m = format!("{who} {img:wi$}  skipped (variable)"); if inter { eprintln!("{m}"); } else { println!("{m}"); } return None; }
             match resolve(img, mode, has("--major")) {
-                Ok((n, note)) if inter => match choose(&s.name, img, n.as_deref(), &note) { Ok(c) => c, Err(()) => { quit = true; None } },
-                Ok((n, note)) => { println!("{:14} {img}  {note}", s.name); n }
-                Err(e) => { eprintln!("{:14} {img}  error: {e}", s.name); errs += 1; None }
+                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => c, Err(()) => { quit = true; None } },
+                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); n }
+                Err(e) => { eprintln!("{who} {img}  error: {e}"); errs += 1; None }
             }
         });
         if quit { eprintln!("aborted, {} not written", s.name); return Ok(1); }
@@ -245,7 +272,7 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         if inter && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} not deployed", s.name); continue; }
         let t = ssh.get(&s.host).ok_or(format!("no ssh target for host {}", s.host))?;
         let mut imgs = vec![];
-        map_images(&new, |i| { imgs.push(i.to_string()); None });
+        map_images(&new, |sv, i| { if want(sv) && !i.contains('$') { imgs.push(i.to_string()); } None });
         for i in imgs { if let Err(e) = run_on(t, &format!("docker pull '{i}'")) { eprintln!("{}: pull {i} failed: {}", s.name, e.lines().last().unwrap_or("")); } }
         let c = ops::deploy(&[s.name.clone()])?;
         if c != 0 { eprintln!("{}: deploy failed (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; continue; }
@@ -277,7 +304,11 @@ mod tests {
     #[test]
     fn rewrites_only_images() {
         let t = "services:\n  a:\n    image: \"x/y:1\" # c\n    command: image: z\n  b:\n    image: ${V}\n";
-        assert_eq!(map_images(t, |i| (i == "x/y:1").then(|| "x/y:2".into())), t.replace("x/y:1", "x/y:2"));
+        assert_eq!(map_images(t, |_, i| (i == "x/y:1").then(|| "x/y:2".into())), t.replace("x/y:1", "x/y:2"));
+        let mut seen = vec![];
+        let t = "services:\n  a:\n    image: x:1\n  # c\n  \"b\":\n    image: y:1\nvolumes:\n  v: {}\n";
+        map_images(t, |s, i| { seen.push((s.to_string(), i.to_string())); None });
+        assert_eq!(seen, [("a".to_string(), "x:1".to_string()), ("b".into(), "y:1".into())]);
     }
     #[test]
     fn health_with_fake_docker() {

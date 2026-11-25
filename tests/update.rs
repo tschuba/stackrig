@@ -59,6 +59,47 @@ fn interactive_quit_writes_nothing() {
 }
 
 #[test]
+fn check_prints_header_and_service_column() {
+    let e = Env::new("hdr");
+    let o = e.run(&["--check", "a"], "");
+    let l: Vec<Vec<String>> = String::from_utf8_lossy(&o.stdout).lines().map(|x| x.split_whitespace().map(String::from).collect()).collect();
+    assert_eq!(l[0][..4], ["STACK", "SERVICE", "IMAGE", "CHANGE"], "{l:?}");
+    assert_eq!(l.iter().filter(|r| r[0] == "STACK").count(), 1, "header only once: {l:?}");
+    assert_eq!(l[1][..3], ["a", "x", "o/x:1.0.0"], "{l:?}");
+    assert_eq!(l[2][..3], ["a", "y", "o/y:1.0.0"], "{l:?}");
+    // interactive prompts carry no header
+    let o = e.run(&["-i", "a"], "q\n");
+    assert!(!err(&o).contains("CHANGE") && err(&o).contains(" x "), "{}", err(&o));
+}
+
+#[test]
+fn variable_images_are_listed_as_skipped_and_never_rewritten() {
+    let e = Env::new("var");
+    let c = "services:\n  x:\n    image: o/x:${TAG:-1.0.0}\n  y:\n    image: o/y:1.0.0\n";
+    fs::write(e.root.join("stacks/a/compose.yml"), c).unwrap();
+    let s = String::from_utf8_lossy(&e.run(&["--check", "a"], "").stdout).into_owned();
+    assert!(s.contains("o/x:${TAG:-1.0.0}") && s.contains("skipped (variable)"), "{s}");
+    assert!(s.contains("o/y:1.0.0") && s.contains("1.0.0 -> 1.1.0"), "{s}");
+    let o = e.run(&["--pin", "a"], "");
+    assert!(String::from_utf8_lossy(&o.stdout).contains("skipped (variable)") && e.compose().contains("o/x:${TAG:-1.0.0}"), "{}", err(&o));
+}
+
+#[test]
+fn service_limits_check_and_update_to_that_service() {
+    let e = Env::new("svc");
+    let o = e.run(&["--check", "a", "--service", "y"], "");
+    let s = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(s.contains("o/y:1.0.0") && !s.contains("o/x:"), "{s}");
+    // interactive: only y is asked (custom tag), x stays; deploy: n
+    let o = e.run(&["-i", "--service", "y", "a"], "1.0.1\nn\n");
+    assert_eq!(e.compose(), "services:\n  x:\n    image: o/x:1.0.0\n  y:\n    image: o/y:1.0.1\n", "{}", err(&o));
+    // bad usage: unknown service, --all, no stack
+    for args in [&["a", "--service", "nope"][..], &["--all", "--service", "y"], &["--service", "y"]] {
+        assert_eq!(e.run(args, "").status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
 fn interactive_rejects_check_and_pin() {
     let e = Env::new("rej");
     for f in ["--check", "--pin"] { assert_eq!(e.run(&["-i", f, "a"], "").status.code(), Some(2), "{f}"); }
