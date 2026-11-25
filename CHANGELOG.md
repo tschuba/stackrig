@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/tschuba/stackrig/compare/v0.2.0...v1.0.0) (2026-11-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* `strig import|migrate|proxy|route` and `strig move coolify` no longer work; use `strig coolify import|migrate|proxy|route|move`.
+
+### Features
+
+* add new, add, domain and mv for homelab stacks ([ad3a38d](https://github.com/tschuba/stackrig/commit/ad3a38d08804c3277bb1078cec15fa3bb07c7587))
+* move Coolify commands under `strig coolify` ([977da5f](https://github.com/tschuba/stackrig/commit/977da5f34b0599d8e65e5b0f45d954f321b6e94f))
+
 ## [0.2.0](https://github.com/tschuba/stackrig/compare/v0.1.0...v0.2.0) (2026-11-25)
 
 
