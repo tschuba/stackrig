@@ -1,7 +1,10 @@
 mod coolify;
 mod doctor;
+mod domain;
 mod help;
 mod mv;
+mod mvstack;
+mod newstack;
 mod ops;
 mod proxy;
 mod render;
@@ -17,7 +20,22 @@ const LOCK: &str = ".lock";
 fn main() {
     use std::process::{exit, Command};
     let mut a: Vec<String> = std::env::args().collect();
+    // `strig coolify <cmd> ...` is the only way in; internally it maps to the old argument shapes
+    let via = a.get(1).map(String::as_str) == Some("coolify");
+    if a.get(1).map(String::as_str) == Some("help") && a.get(2).map(String::as_str) == Some("coolify") && a.len() > 3 { a.remove(2); if a[2] == "move" { a[2] = "coolify-move".into(); } }
+    if via {
+        match a.get(2).map(String::as_str) {
+            Some(c @ ("import" | "migrate" | "move")) => { let c = if c == "move" { "coolify-move".to_string() } else { c.to_string() }; a.remove(2); a.splice(1..2, [c, "coolify".into()]); }
+            Some("-h" | "--help") => {}
+            Some("proxy" | "route") => { a.remove(1); }
+            Some(_) => { eprintln!("error: unknown coolify command `{}`\n\n{}", a[2], help_for("coolify").unwrap()); exit(2) }
+            None => { eprintln!("{}", help_for("coolify").unwrap()); exit(2) }
+        }
+    }
     if let Some(c) = help_main(&a) { exit(c); }
+    if !via && matches!(a.get(1).map(String::as_str), Some("import" | "migrate" | "proxy" | "route")) {
+        eprintln!("error: `strig {0}` moved to `strig coolify {0}`", a[1]); exit(2)
+    }
     let dry = a.iter().skip(1).any(|x| x == "--dry-run");
     a.retain(|x| x != "--dry-run");
     // `--only a,b`: restrict import/migrate to these Coolify names
@@ -38,11 +56,11 @@ fn main() {
     if a.get(1).map(String::as_str) == Some("proxy") {
         match proxy(&mut a, dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(if e.starts_with("usage") { 2 } else { 1 }) } }
     }
-    if a.get(1).map(String::as_str) == Some("move") {
+    if a.get(1).map(String::as_str) == Some("coolify-move") {
         let (from, trust) = (take_opt(&mut a, "--from"), take_opt(&mut a, "--trust"));
         let stop = a.iter().position(|x| x == "--stop").map(|i| a.remove(i)).is_some();
         let (Some("coolify"), Some(n), Some(d)) = (a.get(2).map(String::as_str), a.get(3), a.get(4)) else {
-            eprintln!("usage: strig move coolify <name> <target-dir> [--from <host>] [--stop] [--trust <ip>] [--dry-run]   (see `strig help move`)"); exit(2)
+            eprintln!("usage: strig coolify move <name> <target-dir> [--from <host>] [--stop] [--trust <ip>] [--dry-run]   (see `strig help coolify move`)"); exit(2)
         };
         match move_coolify(n, d, from.as_deref().unwrap_or("local"), stop, trust.as_deref(), dry) { Ok(()) => exit(0), Err(e) => { eprintln!("error: {e}"); exit(1) } }
     }
@@ -50,6 +68,10 @@ fn main() {
         Some("ls") => exit(ops::ls(&a[2..]).map_or_else(|e| { eprintln!("error: {e}"); 1 }, |_| 0)),
         Some("drift") => exit(ops::drift().map_or_else(|e| { eprintln!("error: {e}"); 2 }, |n| (n > 0) as i32)),
         Some("update") => exit(update::update(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
+        Some("mv" | "move") => exit(mvstack::mv(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
+        Some("new") => exit(newstack::new(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
+        Some("add") => exit(newstack::add(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
+        Some("domain") => exit(domain::domain(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
         Some("deploy") => exit(ops::deploy(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
         _ => {}
     }
@@ -66,7 +88,7 @@ fn main() {
         match r { Ok(n) => exit((n > 0) as i32), Err(e) => { eprintln!("error: {e}"); exit(1) } }
     }
     if matches!(a.get(1).map(String::as_str), Some("import" | "migrate")) {
-        eprintln!("usage: strig import|migrate coolify <host|local> <target-dir> [--only a,b] [--dry-run]   (see `strig help import`)"); exit(2)
+        eprintln!("usage: strig coolify import|migrate <host|local> <target-dir> [--only a,b] [--dry-run]   (see `strig help coolify import`)"); exit(2)
     }
     let usage = || -> ! { eprintln!("{HELP}"); exit(2) };
     let (cmd, dir) = match (a.get(1).map(String::as_str), a.get(2)) { (Some(c @ ("render" | "up" | "route")), Some(d)) => (c, std::path::Path::new(d)), _ => usage() };

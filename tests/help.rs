@@ -4,7 +4,7 @@ fn strig(args: &[&str]) -> Output { Command::new(env!("CARGO_BIN_EXE_strig")).ar
 fn out(o: &Output) -> String { String::from_utf8_lossy(&o.stdout).into_owned() }
 fn err(o: &Output) -> String { String::from_utf8_lossy(&o.stderr).into_owned() }
 
-const CMDS: [&str; 11] = ["render", "up", "proxy", "route", "doctor", "import", "migrate", "ls", "drift", "deploy", "update"];
+const CMDS: [&str; 14] = ["new", "add", "render", "up", "coolify", "proxy", "route", "doctor", "import", "migrate", "ls", "drift", "deploy", "update"];
 
 #[test]
 fn overview_lists_all_commands() {
@@ -54,4 +54,23 @@ fn help_does_not_touch_the_filesystem() {
     // `--help` must win over a dir argument: no stack is rendered, no error about a missing dir
     let o = strig(&["render", "/nonexistent-strig-dir", "--help"]);
     assert!(o.status.success() && out(&o).contains("strig render"), "{}", err(&o));
+}
+
+#[test]
+fn coolify_namespace_and_moved_commands() {
+    assert!(out(&strig(&["coolify", "--help"])).contains("strig coolify <import"));
+    assert_eq!(out(&strig(&["help", "coolify", "proxy"])), out(&strig(&["coolify", "proxy", "--help"])));
+    for c in ["import", "migrate", "proxy", "route"] {
+        let o = strig(&[c, "x"]);
+        assert_eq!(o.status.code(), Some(2), "{c}");
+        assert!(err(&o).contains(&format!("moved to `strig coolify {c}`")), "{c}");
+    }
+    assert_eq!(strig(&["coolify", "bogus"]).status.code(), Some(2));
+}
+
+#[test]
+fn mv_and_move_are_aliases() {
+    assert_eq!(out(&strig(&["help", "mv"])), out(&strig(&["move", "--help"])));
+    assert!(out(&strig(&["mv", "--help"])).starts_with("strig mv|move"));
+    assert_eq!(strig(&["mv", "x"]).status.code(), Some(2));
 }

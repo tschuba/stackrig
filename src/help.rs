@@ -7,15 +7,15 @@ USAGE:
 COMMANDS:
     render      Print the final compose YAML of a stack (writes .env.generated)
     up          Render and start a stack with `docker compose up`
-    proxy       Start/stop the inner Traefik behind Coolify's Traefik
-    route       Make Coolify's Traefik forward a stack's domains to the stack host
     doctor      Check host and stacks for problems
-    import      Copy services/applications from a Coolify host
-    migrate     Take over generated secrets from a Coolify host
-    move        Move one Coolify service/application here in one go (data, up, route)
+    coolify     Leave Coolify: import, migrate, move, proxy, route (`strig help coolify`)
     ls          List homelab stacks: host, state, service, image, tag, domains, auth (--show for columns; run in the homelab repo or set STRIG_HOME)
     drift       Compare Git with the hosts (missing, extra, differs)
     update      Check for newer image tags, pin digests, update a stack (pull, deploy, health check)
+    new         Create a homelab stack (compose.yml, meta.yml, vault .env, host_vars)
+    add         Add a service to a homelab stack
+    mv, move    Move a homelab stack to another host (host_vars entry)
+    domain      Add or remove a domain of a homelab stack (meta.yml + Traefik rule)
     deploy      Run Ansible for one stack or host
     help        Show help for a command: `strig help <command>`
 
@@ -27,6 +27,15 @@ A stack is a directory with a compose file; its name (lowercase) is the compose 
 
 pub(crate) fn help_for(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
+        "coolify" => "strig coolify <import|migrate|move|proxy|route> ...
+
+    import    Copy services/applications from a Coolify host
+    migrate   Take over generated secrets from a Coolify host
+    move      Move one Coolify service/application here in one go (data, up, route)
+    proxy     Start/stop the inner Traefik behind Coolify's Traefik
+    route     Make Coolify's Traefik forward a stack's domains to the stack host
+
+Details: `strig help coolify <command>` or `strig coolify <command> --help`.",
         "render" => "strig render <dir> | strig render --all <root>
 
 Renders the compose file of <dir>: fills SERVICE_URL/FQDN/PASSWORD/... variables, adds Traefik
@@ -43,8 +52,8 @@ Renders <dir> into docker-compose.generated.yml and runs `docker compose up -d` 
 --env-file .env (if present) and .env.generated.
 Extra arguments replace the default `-d` and are passed to `docker compose up`.
 Refused if <dir>/.lock exists.",
-        "proxy" => "strig proxy up --trust <ip> [--port 8080] [--to <host>] [--dry-run]
-strig proxy down [--to <host>]
+        "proxy" => "strig coolify proxy up --trust <ip> [--port 8080] [--to <host>] [--dry-run]
+strig coolify proxy down [--to <host>]
 
 up    Creates network `proxy` if missing and starts the inner Traefik `stackrig-proxy` (label stackrig.proxy=true)
       that routes the stacks by their labels on plain http, published on --port (default 8080). Run it again to update it.
@@ -55,8 +64,8 @@ down  Removes the container.
     --dry-run     Print the compose file only
 
 While a container with that label exists (running or not), `render`/`up` emit plain http labels (no TLS, no redirect)
-because Coolify's Traefik terminates TLS. STRIG_BEHIND_PROXY=1|0 forces the mode. Then: `strig route`.",
-        "route" => "strig route <dir> [--from <host>] [--to <host>] [--upstream <url>] [--dest <path>] [--resolver <name>] [--dry-run]
+because Coolify's Traefik terminates TLS. STRIG_BEHIND_PROXY=1|0 forces the mode. Then: `strig coolify route`.",
+        "route" => "strig coolify route <dir> [--from <host>] [--to <host>] [--upstream <url>] [--dest <path>] [--resolver <name>] [--dry-run]
 
 Makes Coolify's Traefik forward the domains of the stack in <dir> to a stack host, by writing
 <dest>/stackrig-<stack>.yaml (one file per stack, entryPoint https, certResolver letsencrypt) on the Coolify host.
@@ -83,7 +92,7 @@ locks, render errors, variables without a value, secrets `up` would newly genera
     --all <root> Check every stack dir below <root>
 
 Exit code 1 if errors remain (warnings do not count).",
-        "import" | "migrate" => "strig import|migrate coolify <host|local> <target-dir> [--only a,b] [--dry-run]
+        "import" | "migrate" => "strig coolify import|migrate <host|local> <target-dir> [--only a,b] [--dry-run]
 
     import    Writes per Coolify service/application docker-compose.yml (domains filled in) and the
               user's .env into <target-dir>/<name>/. Never overwrites. Sets .lock so render/up refuse
@@ -96,7 +105,7 @@ Exit code 1 if errors remain (warnings do not count).",
     --dry-run   Run the real code on a throw-away copy; nothing below <target-dir> changes
 
 Exit code 1 on errors (and for migrate when stacks need attention).",
-        "move" => "strig move coolify <name> <target-dir> [--from <host|local>] [--stop] [--trust <ip>] [--dry-run]
+        "coolify-move" => "strig coolify move <name> <target-dir> [--from <host|local>] [--stop] [--trust <ip>] [--dry-run]
 
 Runs on the stack host (here). Steps: stop the Coolify containers (--stop), start the inner Traefik if missing (--trust),
 import into <target-dir>/<name> (+ migrate for services), copy named volumes into <stack>_<volume>, `up`, `route` into Coolify's Traefik.
@@ -157,6 +166,28 @@ Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a war
                        Images with `${VAR}` are listed as `skipped (variable)` and never changed or pulled; a downgrade (typed tag older than current) is not reported.
 
 Registry access: `crane` if installed, else curl (+ `docker buildx imagetools` for digests). Run in the homelab repo or set STRIG_HOME.",
+        "domain" => "strig domain add|rm <stack> <domain|sub> [--dry-run]
+
+Adds/removes a domain in stacks/<stack>/meta.yml and in the Traefik Host(...) rule of the compose file.
+A bare `sub` is completed with the parent of the stack's first domain. Refuses domains used by another stack
+and rules it cannot edit safely (&&, PathPrefix, several Host rules). Warns if DNS has no record. Deploy afterwards.",
+        "mv" | "move" => "strig mv|move <stack> --to <host> [--dry-run]
+
+Moves the entry of <stack> from its host's host_vars/<host>/stacks.yml to the one of <host> (line-wise, comments stay).
+Nothing else changes: volumes/data stay on the old host (copy them by hand), and the old host keeps its containers.
+Afterwards: `strig deploy <stack>` (new host), then stop the stack on the old host and move its data.
+Refuses unknown stacks/hosts and a stack that is already on <host>.",
+        "new" => "strig new <name> --host <host> --image <image> --domain <domain> [--port 80] [--auth] [--env K=V]... [--yes] [--dry-run]
+
+Creates stacks/<name>/ (compose.yml with Traefik labels in the format of the existing stacks, meta.yml, ansible-vault encrypted .env),
+and appends the stack to host_vars/<host>/stacks.yml. SERVICE_PASSWORD_*/USER_*/BASE64_* ... used in the compose text are generated into
+.env, SERVICE_FQDN_*/URL_* are set from --domain; existing values are never overwritten. Needs ansible-vault and .vault-pass.
+Asks before `strig deploy <name>` (--yes: deploy without asking). Refuses existing stacks and domains used elsewhere.",
+        "add" => "strig add <stack> <service> --image <image> [--domain <domain> [--port 80]] [--env K=V]... [--yes] [--dry-run]
+
+Appends a service to stacks/<stack>/compose.yml (with --domain: Traefik labels, `proxy` network, domain in meta.yml).
+Magic variables (SERVICE_PASSWORD_* ...) in the new service are added to the encrypted .env; existing values are never overwritten.
+Asks before `strig deploy <stack>` (--yes: deploy without asking).",
         "deploy" => "strig deploy <stack> | --host <host> [--pull] [ansible-playbook flags]
 
 Runs `ansible-playbook site.yml --limit <host> [-e only=<stack>]` in the homelab repo (or STRIG_HOME).
