@@ -13,6 +13,11 @@ COMMANDS:
     import      Copy services/applications from a Coolify host
     migrate     Take over generated secrets from a Coolify host
     move        Move one Coolify service/application here in one go (data, up, route)
+    ls          List homelab stacks: host, state, service, image, tag, domains (run in the homelab repo or set STRIG_HOME)
+    domains     List domains with stack, host and forward-auth
+    drift       Compare Git with the hosts (missing, extra, differs)
+    update      Check for newer image tags, pin digests, update a stack (pull, deploy, health check)
+    deploy      Run Ansible for one stack or host
     help        Show help for a command: `strig help <command>`
 
 OPTIONS:
@@ -95,16 +100,75 @@ Exit code 1 on errors (and for migrate when stacks need attention).",
         "move" => "strig move coolify <name> <target-dir> [--from <host|local>] [--stop] [--trust <ip>] [--dry-run]
 
 Runs on the stack host (here). Steps: stop the Coolify containers (--stop), start the inner Traefik if missing (--trust),
-import + migrate into <target-dir>/<name>, copy named volumes into <stack>_<volume>, `up`, `route` into Coolify's Traefik.
+import into <target-dir>/<name> (+ migrate for services), copy named volumes into <stack>_<volume>, `up`, `route` into Coolify's Traefik.
 
-    --from <h>    Coolify host (user@host, or `local` = same host, default)
-    --stop        Stop the running Coolify containers; without it a running app aborts the move
+    --from <h>    Coolify host (user@host, or `local` = Coolify runs on this machine, default). Needed if Coolify is elsewhere.
+    --stop        Stop the running Coolify containers; without it a still-running service/application aborts the move
     --trust <ip>  Needed only if no inner Traefik exists yet (see `strig help proxy`)
-    --dry-run     Print the plan, change nothing
+    --dry-run     Print the plan, change nothing (still reads from the Coolify host)
+
+Needs on the Coolify host (if remote): key-based ssh (BatchMode) and `sudo -n` for docker and /data/coolify.
+Volumes are copied with `alpine` (docker run), so both hosts need docker and that image.
 
 Coolify's containers stay stopped (not removed): to roll back, `docker compose down` here, delete
 stackrig-<stack>.yaml in Coolify's Traefik dir, `docker start` the containers. Afterwards disable the app in Coolify,
 or a redeploy there starts it again. Services: volumes are expected as `<uuid>_<key>`.",
+        "ls" => "strig ls [<stack>...] [--host <host>...] [--show <columns>]
+
+Read-only. Run in the homelab repo (or set STRIG_HOME). Git is the target state: host_vars/<host>/stacks.yml,
+stacks/<name>/{compose.yml,meta.yml}, inventory.yml (ssh target = ansible_user@ansible_host, key-based).
+
+Lists per stack: host, running/all containers, services (name, image, tag), domains (one line per service/domain, the other columns only on the first).
+
+    <stack>...     Only these stacks (several allowed)
+    --host <host>  Only stacks on this host, repeatable (other hosts are not contacted)
+    --show <cols>  Comma list of columns, in this order: stack, host, state, service, image, tag, domains (default: all).
+                   With --show, rows are sorted by these columns in this order (empty last); by default stacks by name, services in compose order. Only `state` needs SSH; without it no host is contacted. E.g. `--show stack,domains`.
+
+Stacks are OR-ed, hosts are OR-ed, both together AND-ed. Any unknown stack/host (or a stack not on the given
+hosts) is an error: exit 1, nothing printed. Hosts that are not reachable over SSH are skipped with a warning.",
+        "domains" => "strig domains [<stack>...] [--host <host>...]
+
+Read-only. Run in the homelab repo (or set STRIG_HOME). Reads host_vars/<host>/stacks.yml and stacks/<name>/meta.yml.
+
+Lists per domain: stack, host, forward-auth (meta.yml `auth` / `auth_domains`). Needs no SSH access.
+
+    <stack>...     Only these stacks' domains (several allowed)
+    --host <host>  Only domains of stacks on this host, repeatable
+
+Stacks are OR-ed, hosts are OR-ed, both together AND-ed. Any unknown stack/host (or a stack not on the given
+hosts) is an error: exit 1, nothing printed.",
+        "drift" => "strig drift
+
+Read-only. Run in the homelab repo (or set STRIG_HOME). Git is the target state: host_vars/<host>/stacks.yml,
+stacks/<name>/compose.yml, inventory.yml (ssh target = ansible_user@ansible_host, key-based).
+
+Compares Git with what runs on each host; prints one line per finding, or `no drift`:
+    missing   stack is in Git but has no containers on the host
+    extra     stack is running on the host but not in Git
+    differs   ~/homelab/stacks/<n>/compose.yml on the host is missing or != compose.yml in Git (only compose.yml is compared)
+
+Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a warning.",
+        "update" => "strig update [-i|--interactive] [--major] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
+
+    --check            Show newer tags (same format: prefix, suffix, number of parts) and the registry digest of `latest`. Writes nothing.
+    -i, --interactive  Interactive (plain update only): per image `Y` apply, `n` keep, a tag to use that version instead (checked in
+                       the registry), `q` abort (nothing written). Images without a newer tag can be changed by typing a tag, too.
+                       Afterwards asks before deploying. Prompts go to stderr.
+    --major            Also take major jumps. Default: stay in the same major (for 0.x the first non-zero part counts: 0.21.x stays 0.21.x);
+                       a higher one is only shown as `(major available: ...)`.
+    --pin              Rewrite `latest`/untagged images to repo:<tag>@sha256:<digest> (tag found by digest among the 20 newest
+                       plain version tags; else repo:latest@sha256:...). Edits compose.yml only, you commit.
+    <stack>|--all      Bump fixed tags to the newest one in compose.yml, `docker pull` all images on the host, `strig deploy`
+                       (Ansible), then wait up to 120 s for health: Docker healthcheck, else running without restarts.
+                       Exit 1 on failure; no automatic rollback (git revert + `strig deploy`). No backup yet.
+                       Images with `${VAR}` are skipped; a downgrade (typed tag older than current) is not reported.
+
+Registry access: `crane` if installed, else curl (+ `docker buildx imagetools` for digests). Run in the homelab repo or set STRIG_HOME.",
+        "deploy" => "strig deploy <stack> | --host <host> [ansible-playbook flags]
+
+Runs `ansible-playbook site.yml --limit <host> [-e only=<stack>]` in the homelab repo (or STRIG_HOME).
+The host comes from host_vars. Extra flags go to Ansible, e.g. `strig deploy beszel --check --diff`.",
         _ => return None,
     })
 }

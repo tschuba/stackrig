@@ -1,0 +1,305 @@
+//! `strig update`: newer tags / digest pinning / update with pre-pull, Ansible deploy and health check. Git stays the truth: only compose.yml images change.
+use crate::{coolify::run_on, ops};
+use serde_json::Value;
+use std::process::Command;
+
+// ---- image refs and versions ----
+
+/// `repo[:tag][@digest]` -> (repo, tag, digest). A `:` before the last `/` is a registry port, not a tag.
+fn split_ref(r: &str) -> (String, Option<String>, Option<String>) {
+    let (r, d) = r.split_once('@').map_or((r, None), |(a, b)| (a, Some(b.to_string())));
+    match r.rfind(':').filter(|&i| !r[i..].contains('/')) {
+        Some(i) => (r[..i].into(), Some(r[i + 1..].into()), d),
+        None => (r.into(), None, d),
+    }
+}
+
+/// (non-digit prefix, numeric parts, suffix): `v1.2.3-alpine` -> ("v", [1,2,3], "-alpine").
+fn parse_tag(t: &str) -> Option<(String, Vec<u64>, String)> {
+    let i = t.find(|c: char| c.is_ascii_digit())?;
+    let rest = &t[i..];
+    let j = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+    let v: Result<Vec<u64>, _> = rest[..j].split('.').map(str::parse).collect();
+    Some((t[..i].into(), v.ok()?, rest[j..].into()))
+}
+
+/// Number of leading parts that must stay equal: up to and including the first non-zero one (`0.21.0` -> 2, `1.2.3` -> 1).
+fn major_len(v: &[u64]) -> usize { v.iter().position(|&x| x != 0).map_or(v.len(), |i| i + 1) }
+
+/// Highest tag in the same format (prefix, suffix, number of parts) that is newer than `cur`; without `major` only within the same major (see `major_len`).
+fn newest(cur: &str, tags: &[String], major: bool) -> Option<String> {
+    let (p, v, s) = parse_tag(cur)?;
+    let k = if major { 0 } else { major_len(&v) };
+    tags.iter().filter_map(|t| { let (tp, tv, ts) = parse_tag(t)?; (tp == p && ts == s && tv.len() == v.len() && tv > v && tv[..k] == v[..k]).then_some((tv, t)) })
+        .max().map(|(_, t)| t.clone())
+}
+
+/// Plain version tags (no suffix), newest first, at most `n`.
+fn recent(tags: &[String], n: usize) -> Vec<String> {
+    let mut v: Vec<_> = tags.iter().filter_map(|t| { let (p, v, s) = parse_tag(t)?; (s.is_empty() && (p.is_empty() || p == "v")).then_some((v, t.clone())) }).collect();
+    v.sort_by(|a, b| b.cmp(a));
+    v.into_iter().take(n).map(|x| x.1).collect()
+}
+
+// ---- registry access: crane > curl + docker > curl ----
+
+fn have(c: &str) -> bool { Command::new("sh").args(["-c", &format!("command -v {c}")]).output().is_ok_and(|o| o.status.success()) }
+
+fn registry(repo: &str) -> (String, String) {
+    match repo.split_once('/') {
+        Some((f, rest)) if f.contains('.') || f.contains(':') || f == "localhost" =>
+            (if f == "docker.io" || f == "index.docker.io" { "registry-1.docker.io".into() } else { f.into() }, rest.into()),
+        Some(_) => ("registry-1.docker.io".into(), repo.into()),
+        None => ("registry-1.docker.io".into(), format!("library/{repo}")),
+    }
+}
+
+fn http(url: &str, accept: &str, head: bool, tok: Option<&str>) -> Result<(u16, String, String), String> {
+    let mut c = Command::new("curl");
+    c.args(["-s", "-i", "--max-time", "30", "-H", &format!("Accept: {accept}")]);
+    if head { c.arg("-I"); }
+    if let Some(t) = tok { c.args(["-H", &format!("Authorization: Bearer {t}")]); }
+    let o = c.arg(url).output().map_err(|e| format!("curl: {e}"))?;
+    let s = String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n");
+    let (h, b) = s.split_once("\n\n").unwrap_or((&s, ""));
+    let st = h.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|x| x.parse().ok()).ok_or(format!("{url}: no HTTP response"))?;
+    Ok((st, h.to_string(), b.to_string()))
+}
+
+fn token(h: &str, repo: &str) -> Result<String, String> {
+    let line = h.lines().find(|l| l.to_lowercase().starts_with("www-authenticate:")).ok_or("registry asks for auth without a challenge")?;
+    let attr = |k: &str| { let p = format!("{k}=\""); let i = line.find(&p)? + p.len(); Some(line[i..].split('"').next()?.to_string()) };
+    let url = format!("{}?service={}&scope={}", attr("realm").ok_or("no realm in auth challenge")?, attr("service").unwrap_or_default(),
+        attr("scope").unwrap_or(format!("repository:{repo}:pull")));
+    let (_, _, b) = http(&url, "application/json", false, None)?;
+    let j: Value = serde_json::from_str(&b).map_err(|e| format!("token: {e}"))?;
+    j["token"].as_str().or(j["access_token"].as_str()).map(String::from).ok_or("no token in response".into())
+}
+
+fn reg_get(repo: &str, suffix: &str, accept: &str, head: bool) -> Result<(String, String), String> {
+    let (host, path) = registry(repo);
+    let url = format!("https://{host}/v2/{path}/{suffix}");
+    let (mut st, mut h, mut b) = http(&url, accept, head, None)?;
+    if st == 401 { let t = token(&h, &path)?; (st, h, b) = http(&url, accept, head, Some(&t))?; }
+    if st != 200 { return Err(format!("{url}: HTTP {st}")); }
+    Ok((h, b))
+}
+
+fn out(c: &mut Command) -> Result<String, String> {
+    let o = c.output().map_err(|e| e.to_string())?;
+    if !o.status.success() { return Err(String::from_utf8_lossy(&o.stderr).trim().to_string()); }
+    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+fn list_tags(repo: &str) -> Result<Vec<String>, String> {
+    if have("crane") { return Ok(out(Command::new("crane").args(["ls", repo]))?.lines().map(String::from).collect()); }
+    // shortcut: first page only (n=1000, no Link following); upgrade if a repo has more tags than that
+    let (_, b) = reg_get(repo, "tags/list?n=1000", "application/json", false)?;
+    let j: Value = serde_json::from_str(&b).map_err(|e| e.to_string())?;
+    Ok(j["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect())
+}
+
+/// Digest of the index/manifest behind `repo:tag` (the same on every architecture).
+fn digest(repo: &str, tag: &str) -> Result<String, String> {
+    let r = format!("{repo}:{tag}");
+    if have("crane") { return out(Command::new("crane").args(["digest", &r])); }
+    if have("docker") {
+        if let Ok(d) = out(Command::new("docker").args(["buildx", "imagetools", "inspect", &r, "--format", "{{.Manifest.Digest}}"])) { return Ok(d); }
+    }
+    let acc = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
+    let (h, _) = reg_get(repo, &format!("manifests/{tag}"), acc, true)?;
+    h.lines().find_map(|l| l.to_lowercase().strip_prefix("docker-content-digest:").map(|d| d.trim().to_string())).ok_or(format!("{r}: no digest header"))
+}
+
+// ---- per-image logic ----
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode { Check, Pin, Update }
+
+/// (new image ref if the compose file should change, note for the user)
+fn resolve(img: &str, mode: Mode, major: bool) -> Result<(Option<String>, String), String> {
+    let (repo, tag, dig) = split_ref(img);
+    match tag.as_deref() {
+        None | Some("latest") => {
+            if dig.is_some() { return Ok((None, "pinned".into())); }
+            let d = digest(&repo, "latest")?;
+            if mode != Mode::Pin { return Ok((None, format!("latest, registry digest {d}"))); }
+            let fixed = recent(&list_tags(&repo)?, 20).into_iter().find(|t| digest(&repo, t).is_ok_and(|x| x == d));
+            Ok(match fixed {
+                Some(t) => (Some(format!("{repo}:{t}@{d}")), format!("latest -> {t}@{d}")),
+                None => (Some(format!("{repo}:latest@{d}")), format!("no fixed tag found for latest, pinned digest only ({d})")),
+            })
+        }
+        Some(t) => {
+            if mode == Mode::Pin { return Ok((None, format!("{t} (fixed)"))); }
+            let tags = list_tags(&repo)?;
+            let hint = match (major, newest(t, &tags, true)) { (false, Some(m)) if newest(t, &tags, false).as_ref() != Some(&m) => format!(" (major available: {m}, use --major)"), _ => String::new() };
+            let Some(n) = newest(t, &tags, major) else { return Ok((None, format!("{t} up to date{hint}"))) };
+            if mode == Mode::Check { return Ok((None, format!("{t} -> {n}{hint}"))); }
+            let new = if dig.is_some() { format!("{repo}:{n}@{}", digest(&repo, &n)?) } else { format!("{repo}:{n}") };
+            Ok((Some(new), format!("{t} -> {n}{hint}")))
+        }
+    }
+}
+
+/// Calls `f` for every `image:` value (variables skipped); `Some` replaces it. Everything else in the file stays byte-identical.
+fn map_images(text: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+    text.split_inclusive('\n').map(|l| {
+        let Some(rest) = l.trim_start().strip_prefix("image:") else { return l.to_string() };
+        let Some(v) = rest.split_whitespace().next().map(|v| v.trim_matches(['"', '\''])) else { return l.to_string() };
+        if v.is_empty() || v.contains('$') { return l.to_string(); }
+        f(v).map_or(l.to_string(), |n| l.replacen(v, &n, 1))
+    }).collect()
+}
+
+// ---- interactive ----
+
+/// Reads one trimmed line from stdin; EOF counts as `q`.
+fn ask(prompt: &str) -> String {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut l = String::new();
+    if std::io::stdin().lock().read_line(&mut l).unwrap_or(0) == 0 { return "q".into(); }
+    l.trim().to_string()
+}
+
+/// Asks about one image. `proposal` is the new ref `resolve` suggests (if any). Returns the new ref, `None` to keep, or Err(()) to quit.
+/// Any other input is taken as a tag and checked against the registry.
+fn choose(stack: &str, img: &str, proposal: Option<&str>, note: &str) -> Result<Option<String>, ()> {
+    let (repo, _, dig) = split_ref(img);
+    loop {
+        eprintln!("{stack:14} {img}  {note}");
+        let a = ask(&match proposal { Some(p) => format!("  apply {p}? [Y]es / [n]o / <tag> / [q]uit: "), None => "  [Enter] keep / <tag> / [q]uit: ".to_string() });
+        match a.as_str() {
+            "q" | "Q" => return Err(()),
+            "n" | "N" => return Ok(None),
+            "" | "y" | "Y" if proposal.is_some() || a.is_empty() => return Ok(proposal.map(String::from)),
+            tag => match digest(&repo, tag) {
+                Ok(d) => return Ok(Some(if dig.is_some() { format!("{repo}:{tag}@{d}") } else { format!("{repo}:{tag}") })),
+                Err(e) => eprintln!("  tag `{tag}` not found: {}", e.lines().last().unwrap_or("")),
+            },
+        }
+    }
+}
+
+// ---- health ----
+
+/// Healthy = every container healthy (or running without restarts / exited 0 if it has no healthcheck) for `min` seconds; error after `max`.
+fn health(t: &str, n: &str, min: u64, max: u64, poll: u64) -> Result<(), String> {
+    let cmd = r#"for c in $(docker ps -aq --filter label=com.docker.compose.project=__N__); do docker inspect --format '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' $c; done"#.replace("__N__", n);
+    let start = std::time::Instant::now();
+    let mut first: std::collections::BTreeMap<String, String> = Default::default();
+    loop {
+        let o = run_on(t, &cmd)?;
+        let mut bad = vec![];
+        for l in o.lines() {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let [name, st, code, rc, h] = f[..] else { continue };
+            let rc0 = first.entry(name.into()).or_insert(rc.into()).clone();
+            let ok = match (h, st) { ("healthy", _) => true, ("-", "running") => rc == rc0, ("-", "exited") => code == "0", _ => false };
+            if !ok { bad.push(format!("{name} ({st}, health {h}, restarts {rc})")); }
+        }
+        if o.trim().is_empty() { bad.push("no containers".into()); }
+        let el = start.elapsed().as_secs();
+        if bad.is_empty() && el >= min { return Ok(()); }
+        if el >= max { return Err(format!("{n}: not healthy after {max} s: {}", bad.join(", "))); }
+        std::thread::sleep(std::time::Duration::from_secs(poll));
+    }
+}
+
+// ---- command ----
+
+pub(crate) fn update(a: &[String]) -> Result<i32, String> {
+    let usage = || "usage: strig update [-i] [--major] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all".to_string();
+    let has = |f: &str| a.iter().any(|x| x == f);
+    let mode = if has("--check") { Mode::Check } else if has("--pin") { Mode::Pin } else { Mode::Update };
+    let inter = has("-i") || has("--interactive");
+    if inter && mode != Mode::Update { return Err("-i/--interactive only works with a plain update (not --check/--pin)".into()); }
+    let name = a.iter().find(|x| !x.starts_with('-'));
+    if name.is_none() && !has("--all") && mode != Mode::Check { return Err(usage()); }
+    let root = ops::root();
+    let (stacks, ssh) = ops::load(&root)?;
+    let targets: Vec<_> = stacks.iter().filter(|s| name.is_none_or(|n| *n == s.name)).collect();
+    if targets.is_empty() { return Err(format!("unknown stack `{}`", name.unwrap())); }
+    let mut rc = 0;
+    for s in targets {
+        let dir = root.join("stacks").join(&s.name);
+        let Some(file) = ["compose.yml", "compose.yaml", "docker-compose.yml"].iter().map(|f| dir.join(f)).find(|p| p.exists()) else { eprintln!("{}: no compose file", s.name); rc = 1; continue };
+        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        let mut errs = 0;
+        let mut quit = false;
+        let new = map_images(&text, |img| {
+            if quit { return None; }
+            match resolve(img, mode, has("--major")) {
+                Ok((n, note)) if inter => match choose(&s.name, img, n.as_deref(), &note) { Ok(c) => c, Err(()) => { quit = true; None } },
+                Ok((n, note)) => { println!("{:14} {img}  {note}", s.name); n }
+                Err(e) => { eprintln!("{:14} {img}  error: {e}", s.name); errs += 1; None }
+            }
+        });
+        if quit { eprintln!("aborted, {} not written", s.name); return Ok(1); }
+        if errs > 0 { rc = 1; if mode != Mode::Check { eprintln!("{}: skipped", s.name); } continue; }
+        if mode == Mode::Check { continue; }
+        if new != text { std::fs::write(&file, &new).map_err(|e| e.to_string())?; println!("{:14} {} written (review and commit)", s.name, file.display()); }
+        if mode == Mode::Pin { continue; }
+        if inter && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} not deployed", s.name); continue; }
+        let t = ssh.get(&s.host).ok_or(format!("no ssh target for host {}", s.host))?;
+        let mut imgs = vec![];
+        map_images(&new, |i| { imgs.push(i.to_string()); None });
+        for i in imgs { if let Err(e) = run_on(t, &format!("docker pull '{i}'")) { eprintln!("{}: pull {i} failed: {}", s.name, e.lines().last().unwrap_or("")); } }
+        let c = ops::deploy(&[s.name.clone()])?;
+        if c != 0 { eprintln!("{}: deploy failed (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; continue; }
+        match health(t, &s.name, 10, 120, 5) {
+            Ok(()) => println!("{:14} healthy", s.name),
+            Err(e) => { eprintln!("{e}\nroll back: git revert, then `strig deploy {}`", s.name); rc = 1; }
+        }
+    }
+    Ok(rc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn v(x: &[&str]) -> Vec<String> { x.iter().map(|s| s.to_string()).collect() }
+    #[test]
+    fn refs_and_versions() {
+        assert_eq!(split_ref("localhost:5000/a/b:1@sha256:x"), ("localhost:5000/a/b".into(), Some("1".into()), Some("sha256:x".into())));
+        assert_eq!(split_ref("localhost:5000/a").1, None);
+        assert_eq!(newest("0.21.0", &v(&["0.21.0", "0.21.2", "0.22.1", "0.9.9", "latest", "0.23.0-alpine", "1.0"]), false), Some("0.21.2".into()));
+        assert_eq!(newest("0.21.0", &v(&["0.21.2", "0.22.1", "1.0.0"]), true), Some("1.0.0".into()));
+        assert_eq!(newest("1.2.3", &v(&["1.9.0", "2.0.0"]), false), Some("1.9.0".into()));
+        assert_eq!(newest("v1.2-alpine", &v(&["v1.3-alpine", "v1.4", "1.5-alpine"]), false), Some("v1.3-alpine".into()));
+        assert_eq!(recent(&v(&["1.0", "1.10", "1.9", "latest", "2.0-rc"]), 2), ["1.10", "1.9"]);
+        assert_eq!(registry("nginx").1, "library/nginx");
+        assert_eq!(registry("ghcr.io/a/b").0, "ghcr.io");
+        assert_eq!(registry("henrygd/beszel").0, "registry-1.docker.io");
+    }
+    #[test]
+    fn rewrites_only_images() {
+        let t = "services:\n  a:\n    image: \"x/y:1\" # c\n    command: image: z\n  b:\n    image: ${V}\n";
+        assert_eq!(map_images(t, |i| (i == "x/y:1").then(|| "x/y:2".into())), t.replace("x/y:1", "x/y:2"));
+    }
+    #[test]
+    fn health_with_fake_docker() {
+        let d = std::env::temp_dir().join(format!("strig-health-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let dk = d.join("docker");
+        // `ps` lists one id per stack name; `inspect` prints the state line stored in a file named after the stack
+        std::fs::write(&dk, format!("#!/bin/sh\ncase \"$1\" in ps) echo c;; inspect) cat '{}'/state;; esac\n", d.display())).unwrap();
+        std::fs::set_permissions(&dk, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // shortcut: PATH is process-wide; this is the only test touching it
+        unsafe { std::env::set_var("PATH", format!("{}:{}", d.display(), std::env::var("PATH").unwrap())); }
+        let st = |l: &str| std::fs::write(d.join("state"), format!("{l}\n")).unwrap();
+        st("/a running 0 0 healthy");
+        assert!(health("local", "a", 0, 3, 1).is_ok());
+        st("/a running 0 0 -");
+        assert!(health("local", "a", 0, 3, 1).is_ok());
+        st("/a running 0 0 starting");
+        assert!(health("local", "a", 0, 2, 1).unwrap_err().contains("starting"));
+        st("/a exited 1 0 -");
+        assert!(health("local", "a", 0, 2, 1).unwrap_err().contains("exited"));
+        st("");
+        assert!(health("local", "a", 0, 2, 1).unwrap_err().contains("no containers"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
