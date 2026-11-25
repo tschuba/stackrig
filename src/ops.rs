@@ -103,7 +103,7 @@ pub(crate) fn ls(a: &[String]) -> Result<(), String> {
         if x == "--show" { if cols.replace(it.next().ok_or_else(usage)?).is_some() { return Err(usage()); } } else { rest.push(x.clone()); }
     }
     let shown = cols.is_some();
-    let cols: Vec<&str> = cols.map_or(COLS[..7].to_vec(), |c| c.split(',').collect());
+    let cols: Vec<&str> = cols.map_or(COLS.to_vec(), |c| c.split(',').collect());
     if let Some(c) = cols.iter().find(|c| !COLS.contains(c)) { return Err(format!("unknown column `{c}` (one of: {})", COLS.join(", "))); }
     let (stacks, ssh) = filtered("ls", &rest)?;
     // `name:tag` -> (name, tag); the first `:` after the last `/` splits (an earlier one is a registry port, a later one is inside `${VAR:-x}`)

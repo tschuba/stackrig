@@ -13,7 +13,7 @@ COMMANDS:
     import      Copy services/applications from a Coolify host
     migrate     Take over generated secrets from a Coolify host
     move        Move one Coolify service/application here in one go (data, up, route)
-    ls          List homelab stacks: host, state, service, image, tag, domains (--show for columns, auth; run in the homelab repo or set STRIG_HOME)
+    ls          List homelab stacks: host, state, service, image, tag, domains, auth (--show for columns; run in the homelab repo or set STRIG_HOME)
     drift       Compare Git with the hosts (missing, extra, differs)
     update      Check for newer image tags, pin digests, update a stack (pull, deploy, health check)
     deploy      Run Ansible for one stack or host
@@ -121,7 +121,7 @@ Lists per stack: host, running/all containers, services (name, image, tag), doma
 
     <stack>...     Only these stacks (several allowed)
     --host <host>  Only stacks on this host, repeatable (other hosts are not contacted)
-    --show <cols>  Comma list of columns, in this order: stack, host, state, service, image, tag, domains, auth (default: all but auth).
+    --show <cols>  Comma list of columns, in this order: stack, host, state, service, image, tag, domains, auth (default: all).
                    `auth` is yes/no per domain (meta.yml `auth` / `auth_domains`).
                    With --show, rows are sorted by these columns in this order (empty last); by default stacks by name, services in compose order. Only `state` needs SSH; without it no host is contacted.
                    E.g. `--show domains,stack,host,auth` lists all domains.

@@ -45,7 +45,7 @@ fn service_with_two_domains_gets_follow_up_line_and_unlabelled_domain_comes_last
     // default view: compose order (z, y), domains per meta.yml order, y's second domain on a follow-up line, domain without any label last
     let w = words(&Env::new("domains").ls(&["b", "--host", "pi"]));
     let flat: Vec<String> = w.iter().skip(1).map(|r| r.join(" ")).collect();
-    assert_eq!(flat, ["b pi 10/10 up z o/z 2", "y o/y 1 y2.org", "y1.org", "extra.org"].map(String::from), "{w:?}");
+    assert_eq!(flat, ["b pi 10/10 up z o/z 2", "y o/y 1 y2.org no", "y1.org no", "extra.org no"].map(String::from), "{w:?}");
 }
 
 #[test]
