@@ -13,10 +13,10 @@ fn migrate_dry_run_leaves_target_untouched() {
     fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(target.join("svc/docker-compose.yml"), "services:\n  a:\n    image: x\n    environment:\n      - P=${SERVICE_PASSWORD_DB}\n").unwrap();
     let lock = target.join("svc/.lock");
-    let lock_text = "import coolify: waiting for `strig migrate coolify` (render/up would create new random values)";
+    let lock_text = "import coolify: waiting for `strig coolify migrate` (render/up would create new random values)";
     fs::write(&lock, lock_text).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_strig")).args(["migrate", "coolify", "local"]).arg(&target).arg("--dry-run")
+    let out = Command::new(env!("CARGO_BIN_EXE_strig")).args(["coolify", "migrate", "local"]).arg(&target).arg("--dry-run")
         .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("svc: 1 lines of .env.generated taken over"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
@@ -35,7 +35,7 @@ fn import_dry_run_writes_nothing() {
     let sudo = bin.join("sudo");
     fs::write(&sudo, "#!/bin/sh\nshift\ncase \"$*\" in\n *'from applications'*) ;;\n *'from services order'*) echo u1,svc;;\n *docker_compose_raw*) printf 'services:\\n  a:\\n    image: x\\n';;\n 'cat '*) echo MY_VAR=1;;\nesac\n").unwrap();
     fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |extra: &[&str]| Command::new(env!("CARGO_BIN_EXE_strig")).args(["import", "coolify", "local"]).arg(&target).args(extra)
+    let run = |extra: &[&str]| Command::new(env!("CARGO_BIN_EXE_strig")).args(["coolify", "import", "local"]).arg(&target).args(extra)
         .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())).output().unwrap();
 
     let out = run(&["--dry-run"]);

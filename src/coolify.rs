@@ -100,7 +100,7 @@ fn check_only<'a>(only: &[String], known: impl Iterator<Item = &'a (String, Stri
 }
 
 /// Reason `import` writes; `migrate` removes the lock only if it still holds exactly this text (never a hand-made one).
-pub(crate) const IMPORT_LOCK: &str = "import coolify: waiting for `strig migrate coolify` (render/up would create new random values)";
+pub(crate) const IMPORT_LOCK: &str = "import coolify: waiting for `strig coolify migrate` (render/up would create new random values)";
 
 /// `import coolify <host|local> <target-dir>`: writes `docker-compose.yml` (domains filled in) and the user's `.env` per Coolify service.
 /// Reads only; never overwrites. `.env.generated` is left to `migrate`.

@@ -56,12 +56,12 @@ pub(crate) fn proxy(a: &mut Vec<String>, dry: bool) -> Result<(), String> {
             run_on_in(to, &format!("(docker network inspect proxy >/dev/null 2>&1 || docker network create proxy >/dev/null) && docker compose -f - up -d 2>&1"), Some(&yaml))?;
             eprintln!("inner Traefik `{NAME}` running on {to}, port {port} (trusts {trust})");
             if let Some(o) = old.filter(|o| *o != port.to_string()) {
-                eprintln!("note: port changed {o} -> {port}; the files written by `strig route` still point to {o}, run `strig route` again for each stack");
+                eprintln!("note: port changed {o} -> {port}; the files written by `strig coolify route` still point to {o}, run `strig coolify route` again for each stack");
             }
             Ok(())
         }
         Some("down") => { run_on(to, &format!("docker rm -f {NAME}"))?; eprintln!("`{NAME}` removed on {to}"); Ok(()) }
-        _ => Err("usage: strig proxy up --trust <ip> [--port 8080] [--to <host>] [--dry-run] | strig proxy down [--to <host>]".into()),
+        _ => Err("usage: strig coolify proxy up --trust <ip> [--port 8080] [--to <host>] [--dry-run] | strig coolify proxy down [--to <host>]".into()),
     }
 }
 

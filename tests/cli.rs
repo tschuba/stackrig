@@ -81,10 +81,10 @@ fn render_all_reports_each_stack_and_fails_on_errors() {
 #[test]
 fn import_migrate_without_host_or_dir_is_a_usage_error() {
     let e = Env::new("usage");
-    for args in [&["import", "coolify"][..], &["migrate", "coolify", "local"]] {
+    for args in [&["coolify", "import"][..], &["coolify", "migrate", "local"]] {
         let o = e.run(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}");
-        assert!(out(&o).contains("usage: strig import|migrate coolify"), "{args:?}: {}", out(&o));
+        assert!(out(&o).contains("usage: strig coolify import|migrate"), "{args:?}: {}", out(&o));
     }
 }
 
@@ -129,7 +129,7 @@ fn coolify_app_env(name: &str, running: bool) -> Env {
 fn import_copies_application_and_its_bind_mounted_file() {
     let e = coolify_app_env("app", false);
     let t = e.root.join("target");
-    let o = e.run(&["import", "coolify", "local", t.to_str().unwrap()]);
+    let o = e.run(&["coolify", "import", "local", t.to_str().unwrap()]);
     assert!(o.status.success(), "{}", out(&o));
     assert!(out(&o).contains("app (application): .env: 1 lines, 1 file(s) copied"), "{}", out(&o));
     assert!(fs::read_to_string(t.join("app/docker-compose.yml")).unwrap().contains("./state.json:/app/state.json"));
@@ -141,13 +141,13 @@ fn import_copies_application_and_its_bind_mounted_file() {
 fn import_refuses_when_application_with_files_is_running() {
     let e = coolify_app_env("apprun", true);
     let t = e.root.join("target");
-    let o = e.run(&["import", "coolify", "local", t.to_str().unwrap()]);
+    let o = e.run(&["coolify", "import", "local", t.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1));
     assert!(out(&o).contains("nothing imported: application(s) app still running"), "{}", out(&o));
     assert!(!t.join("app").exists(), "nothing may be written");
 }
 
-const IMPORT_LOCK: &str = "import coolify: waiting for `strig migrate coolify` (render/up would create new random values)";
+const IMPORT_LOCK: &str = "import coolify: waiting for `strig coolify migrate` (render/up would create new random values)";
 
 /// Fake Coolify host with services `svc` (uuid u1), `hand` (u2) and `new` (u3, never imported); `svc` has a running container
 /// holding the generated password and mounting /srv/data. Service env file: one user var, one generated secret.
@@ -169,7 +169,7 @@ fn coolify_migrate_env(name: &str) -> (Env, PathBuf) {
 #[test]
 fn migrate_takes_over_secrets_unlocks_and_warns_about_bind_mounts() {
     let (e, t) = coolify_migrate_env("migrate");
-    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]);
+    let o = e.run(&["coolify", "migrate", "local", t.to_str().unwrap()]);
     let s = out(&o);
     // `new` was never imported -> error -> exit 1, but the others are still processed
     assert_eq!(o.status.code(), Some(1), "{s}");
@@ -183,18 +183,18 @@ fn migrate_takes_over_secrets_unlocks_and_warns_about_bind_mounts() {
 #[test]
 fn migrate_only_touches_the_named_stacks_and_rejects_unknown_names() {
     let (e, t) = coolify_migrate_env("only");
-    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap(), "--only", "svc"]);
+    let o = e.run(&["coolify", "migrate", "local", t.to_str().unwrap(), "--only", "svc"]);
     let s = out(&o);
     assert_eq!(o.status.code(), Some(0), "{s}");
     assert!(s.contains("svc:") && !s.contains("new:") && !s.contains("hand:"), "{s}");
-    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap(), "--only", "nope"]);
+    let o = e.run(&["coolify", "migrate", "local", t.to_str().unwrap(), "--only", "nope"]);
     assert!(out(&o).contains("--only nope: no such"), "{}", out(&o));
 }
 
 #[test]
 fn migrate_skips_a_hand_made_lock() {
     let (e, t) = coolify_migrate_env("handlock");
-    let s = out(&e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]));
+    let s = out(&e.run(&["coolify", "migrate", "local", t.to_str().unwrap()]));
     assert!(s.contains("hand: SKIPPED, locked (.lock): do not touch"), "{s}");
     assert_eq!(fs::read_to_string(t.join("hand/.lock")).unwrap(), "do not touch");
     assert!(!t.join("hand/.env.generated").exists());
@@ -204,7 +204,7 @@ fn migrate_skips_a_hand_made_lock() {
 fn migrate_is_idempotent_and_never_overwrites_generated_values() {
     let (e, t) = coolify_migrate_env("idem");
     fs::write(t.join("svc/.env.generated"), "SERVICE_PASSWORD_DB=mine\n").unwrap();
-    let o = e.run(&["migrate", "coolify", "local", t.to_str().unwrap()]);
+    let o = e.run(&["coolify", "migrate", "local", t.to_str().unwrap()]);
     assert!(out(&o).contains("ERROR    svc"), "write_new must refuse to overwrite: {}", out(&o));
     assert_eq!(fs::read_to_string(t.join("svc/.env.generated")).unwrap(), "SERVICE_PASSWORD_DB=mine\n");
 }
@@ -214,7 +214,7 @@ fn non_local_host_goes_over_ssh() {
     let e = Env::new("ssh");
     let log = e.root.join("ssh.log");
     e.script("ssh", &format!("echo \"$@\" >> '{}'; exit 1", log.display()));
-    let o = e.run(&["import", "coolify", "me@pi", e.root.join("t").to_str().unwrap()]);
+    let o = e.run(&["coolify", "import", "me@pi", e.root.join("t").to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1));
     let l = fs::read_to_string(&log).unwrap();
     assert!(l.starts_with("-o BatchMode=yes me@pi sudo -n docker exec coolify-db"), "{l}");
@@ -230,15 +230,15 @@ fn route_derives_everything_from_the_hosts() {
     e.script("ip", "echo '1.1.1.1 via 192.168.178.1 dev eth0 src 192.168.178.50 uid 1000'");
     e.script("docker", &format!("case \"$*\" in\n *Mounts*) echo '[{{\"Source\":\"{}\",\"Destination\":\"/traefik\"}}]';;\n *Config.Cmd*) echo '[\"--providers.file.directory=/traefik/dynamic/\"]';;\n *Ports*) echo '{{\"80/tcp\":[{{\"HostIp\":\"0.0.0.0\",\"HostPort\":\"8080\"}}]}}';;\nesac", t.display()));
     let dir = d.to_str().unwrap();
-    let o = e.run(&["route", dir, "--dry-run"]);
+    let o = e.run(&["coolify", "route", dir, "--dry-run"]);
     let y = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success() && y.contains("url: 'http://192.168.178.50:8080'") && y.contains("Host(`app.example.net`)"), "{y} {}", String::from_utf8_lossy(&o.stderr));
     assert!(!t.join("dynamic/stackrig-app.yaml").exists(), "dry run must not write");
-    let o = e.run(&["route", dir]);
+    let o = e.run(&["coolify", "route", dir]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(fs::read_to_string(t.join("dynamic/stackrig-app.yaml")).unwrap(), y);
     // overrides skip the lookups
-    let o = e.run(&["route", dir, "--upstream", "http://10.0.0.9:1", "--dest", t.join("dynamic").to_str().unwrap(), "--resolver", "r2"]);
+    let o = e.run(&["coolify", "route", dir, "--upstream", "http://10.0.0.9:1", "--dest", t.join("dynamic").to_str().unwrap(), "--resolver", "r2"]);
     assert!(o.status.success());
     let f = fs::read_to_string(t.join("dynamic/stackrig-app.yaml")).unwrap();
     assert!(f.contains("http://10.0.0.9:1") && f.contains("certResolver: r2"));
@@ -269,8 +269,8 @@ fn inner_proxy_container_switches_labels_and_proxy_up_runs_on_the_host() {
     assert!(!String::from_utf8_lossy(&o.stdout).contains("certresolver"), "label container must switch the mode");
     e.script("docker", &format!("echo \"$*\" >> {}\ncat >> {}.stdin", log.display(), log.display()));
     assert!(String::from_utf8_lossy(&e.run(&["render", d.to_str().unwrap()]).stdout).contains("certresolver"));
-    assert_eq!(e.run(&["proxy", "up"]).status.code(), Some(1), "--trust is required");
-    let o = e.run(&["proxy", "up", "--trust", "10.0.0.2", "--port", "8081"]);
+    assert_eq!(e.run(&["coolify", "proxy", "up"]).status.code(), Some(1), "--trust is required");
+    let o = e.run(&["coolify", "proxy", "up", "--trust", "10.0.0.2", "--port", "8081"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let sent = fs::read_to_string(format!("{}.stdin", log.display())).unwrap();
     assert!(sent.contains("stackrig.proxy=true") && sent.contains("'8081:80'") && sent.contains("10.0.0.2/32"), "{sent}");
@@ -281,6 +281,6 @@ fn proxy_up_warns_when_the_port_changes() {
     let e = Env::new("proxyport");
     e.script("docker", "case \"$*\" in 'inspect'*) echo '{\"80/tcp\":[{\"HostPort\":\"8080\"}]}';; esac\ncat >/dev/null");
     let err = |a: &[&str]| String::from_utf8_lossy(&e.run(a).stderr).into_owned();
-    assert!(err(&["proxy", "up", "--trust", "10.0.0.2", "--port", "9000"]).contains("port changed 8080 -> 9000"));
-    assert!(!err(&["proxy", "up", "--trust", "10.0.0.2"]).contains("port changed"));
+    assert!(err(&["coolify", "proxy", "up", "--trust", "10.0.0.2", "--port", "9000"]).contains("port changed 8080 -> 9000"));
+    assert!(!err(&["coolify", "proxy", "up", "--trust", "10.0.0.2"]).contains("port changed"));
 }
