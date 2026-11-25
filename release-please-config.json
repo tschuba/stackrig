@@ -1,3 +1,9 @@
 {
-  "packages": { ".": { "release-type": "rust", "include-component-in-tag": false } }
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "include-component-in-tag": false,
+      "extra-files": [{ "type": "generic", "path": "Formula/stackrig.rb" }]
+    }
+  }
 }

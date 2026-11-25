@@ -2,6 +2,15 @@
 
 CLI that runs Coolify-generated compose stacks without Coolify. See `strig help`.
 
+## Install (Homebrew)
+
+```sh
+brew tap tschuba/stackrig https://github.com/tschuba/stackrig
+brew install stackrig        # latest release, built from source (needs Rust, installed by brew)
+brew upgrade stackrig        # update
+brew install --HEAD stackrig # current master
+```
+
 ## Stacks behind Coolify's Traefik (inner Traefik)
 
 Run strig stacks on another host (or next to Coolify) and let Coolify's Traefik forward their domains to one inner Traefik.
@@ -18,7 +27,7 @@ Versioning is automated with [release-please](https://github.com/googleapis/rele
 
 - Commits and PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `feat!:`). `ci:`/`chore:`/`docs:` do not trigger a release.
 - Only squash merges are allowed; the PR title becomes the commit message. The `pr-title` workflow enforces the format.
-- Every push to `master` updates a release PR (version bump in `Cargo.toml`, changelog). Merging it creates the tag and GitHub release, and attaches `strig-linux-arm64`.
+- Every push to `master` updates a release PR (version bump in `Cargo.toml` and `Formula/stackrig.rb`, changelog). Merging it creates the tag and GitHub release, and attaches `strig-linux-arm64`.
 
 ## Repo settings
 
