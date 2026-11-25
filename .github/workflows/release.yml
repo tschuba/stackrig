@@ -18,14 +18,85 @@ jobs:
   build:
     needs: release-please
     if: needs.release-please.outputs.created == 'true'
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup target add aarch64-unknown-linux-musl
+      - run: rustup target add ${{ matrix.target }}
       - run: cargo test
-      - run: cargo build --release --target aarch64-unknown-linux-musl
-      - run: cp target/aarch64-unknown-linux-musl/release/strig strig-linux-arm64
-      - run: gh release upload "$TAG" strig-linux-arm64
+        if: ${{ !startsWith(matrix.target, 'x86_64-apple') }} # cross-compiled, can't run on arm runner
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: package and upload
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release-please.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="strig-${TAG#v}-$TARGET"
+          tar -czf "$name.tar.gz" -C "target/$TARGET/release" strig
+          gh release upload "$TAG" "$name.tar.gz"
+
+  tap:
+    needs: [release-please, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }} # PAT with contents:write on the tap repo
+      - name: write formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          v=${TAG#v}
+          base="https://github.com/$REPO/releases/download/$TAG/strig-$v"
+          sha() { gh release download "$TAG" -R "$REPO" -p "strig-$v-$1.tar.gz" -O - | sha256sum | cut -d' ' -f1; }
+          mkdir -p Formula
+          cat > Formula/stackrig.rb <<EOF
+          class Stackrig < Formula
+            desc "Runs Coolify-generated compose stacks without Coolify"
+            homepage "https://github.com/$REPO"
+            version "$v"
+
+            on_macos do
+              on_arm do
+                url "$base-aarch64-apple-darwin.tar.gz"
+                sha256 "$(sha aarch64-apple-darwin)"
+              end
+              on_intel do
+                url "$base-x86_64-apple-darwin.tar.gz"
+                sha256 "$(sha x86_64-apple-darwin)"
+              end
+            end
+            on_linux do
+              on_arm do
+                url "$base-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "$(sha aarch64-unknown-linux-musl)"
+              end
+              on_intel do
+                url "$base-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "$(sha x86_64-unknown-linux-musl)"
+              end
+            end
+
+            def install
+              bin.install "strig"
+            end
+
+            test do
+              assert_predicate bin/"strig", :exist?
+            end
+          end
+          EOF
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add Formula/stackrig.rb
+          git commit -m "stackrig $v" && git push
