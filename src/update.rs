@@ -332,6 +332,15 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         let names: Vec<String> = match &shared { Some(b) => vec![b.clone()], None => targets.iter().map(|s| format!("strig/update-{}-{date}", s.name)).collect() };
         crate::gitops::preflight(&root, d, &names)?;
     }
+    // one header for all stacks, so the columns are sized over every stack first
+    let (mut gw, mut gwi, mut ghdr) = (7, 5, false);
+    {
+        for s in &targets {
+            let Some(f) = ["compose.yml", "compose.yaml", "docker-compose.yml"].iter().map(|f| root.join("stacks").join(&s.name).join(f)).find(|p| p.exists()) else { continue };
+            let Ok(t) = std::fs::read_to_string(&f) else { continue };
+            map_images(&t, |sv, i| { if want0(&s.name, sv) { gw = gw.max(sv.len() + 1); gwi = gwi.max(i.len()); } None });
+        }
+    }
     let mut on_shared = false; // the shared branch is created lazily, at the first stack with changes
     for s in targets {
         let want = |sv: &str| want0(&s.name, sv);
@@ -342,7 +351,8 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         let mut quit = false;
         let (mut w, mut wi) = (7, 5); // service column gets +1 below so names never touch the image
         map_images(&text, |sv, i| { if want(sv) { w = w.max(sv.len() + 1); wi = wi.max(i.len()); } None });
-        let mut header = inter;
+        (w, wi) = (gw, gwi);
+        let mut header = inter || ghdr;
         let mut env: Option<Result<(String, bool), String>> = None;
         let mut notes: Vec<String> = vec![]; // one line per changed service, for the commit body
         let mut chg: Vec<(String, Option<String>)> = vec![]; // (variable, new value) per image that uses it
@@ -394,6 +404,7 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
             }
         });
         if n_upd > upd0 { n_stk += 1; }
+        if header && !inter { ghdr = true; }
         if quit { eprintln!("aborted, {} not written", s.name); return Ok(1); }
         if errs > 0 { rc = 1; if mode != Mode::Check { eprintln!("{}: skipped", s.name); } continue; }
         // one value per variable: changed only if every image using it agrees
