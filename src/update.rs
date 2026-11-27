@@ -116,28 +116,32 @@ fn digest(repo: &str, tag: &str) -> Result<String, String> {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode { Check, Pin, Update }
 
+/// What `resolve` found, for `--outdated`: only `Upd` counts as an update.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind { Upd, Latest, Major, Same }
+
 /// (new image ref if the compose file should change, note for the user)
-fn resolve(img: &str, mode: Mode, major: bool) -> Result<(Option<String>, String), String> {
+fn resolve(img: &str, mode: Mode, major: bool) -> Result<(Option<String>, String, Kind), String> {
     let (repo, tag, dig) = split_ref(img);
     match tag.as_deref() {
         None | Some("latest") => {
-            if dig.is_some() { return Ok((None, "pinned".into())); }
+            if dig.is_some() { return Ok((None, "pinned".into(), Kind::Same)); }
             let d = digest(&repo, "latest")?;
-            if mode != Mode::Pin { return Ok((None, format!("latest, registry digest {d}"))); }
+            if mode != Mode::Pin { return Ok((None, format!("latest, registry digest {d}"), Kind::Latest)); }
             let fixed = recent(&list_tags(&repo)?, 20).into_iter().find(|t| digest(&repo, t).is_ok_and(|x| x == d));
             Ok(match fixed {
-                Some(t) => (Some(format!("{repo}:{t}@{d}")), format!("latest -> {t}@{d}")),
-                None => (Some(format!("{repo}:latest@{d}")), format!("no fixed tag found for latest, pinned digest only ({d})")),
+                Some(t) => (Some(format!("{repo}:{t}@{d}")), format!("latest -> {t}@{d}"), Kind::Same),
+                None => (Some(format!("{repo}:latest@{d}")), format!("no fixed tag found for latest, pinned digest only ({d})"), Kind::Same),
             })
         }
         Some(t) => {
-            if mode == Mode::Pin { return Ok((None, format!("{t} (fixed)"))); }
+            if mode == Mode::Pin { return Ok((None, format!("{t} (fixed)"), Kind::Same)); }
             let tags = list_tags(&repo)?;
             let hint = match (major, newest(t, &tags, true)) { (false, Some(m)) if newest(t, &tags, false).as_ref() != Some(&m) => format!(" (major available: {m}, use --major)"), _ => String::new() };
-            let Some(n) = newest(t, &tags, major) else { return Ok((None, format!("{t} up to date{hint}"))) };
-            if mode == Mode::Check { return Ok((None, format!("{t} -> {n}{hint}"))); }
+            let Some(n) = newest(t, &tags, major) else { return Ok((None, format!("{t} up to date{hint}"), if hint.is_empty() { Kind::Same } else { Kind::Major })) };
+            if mode == Mode::Check { return Ok((None, format!("{t} -> {n}{hint}"), Kind::Upd)); }
             let new = if dig.is_some() { format!("{repo}:{n}@{}", digest(&repo, &n)?) } else { format!("{repo}:{n}") };
-            Ok((Some(new), format!("{t} -> {n}{hint}")))
+            Ok((Some(new), format!("{t} -> {n}{hint}"), Kind::Upd))
         }
     }
 }
@@ -276,7 +280,7 @@ fn glob(p: &str, t: &str) -> bool {
 }
 
 pub(crate) fn update(a: &[String]) -> Result<i32, String> {
-    let usage = || "usage: strig update [-i] [--major] [--deploy] --check|--pin|(plain) <stack>|--all   [--commit|--branch|--single-branch[=<name>]|--push|--pr] [--include <pattern>...] [--exclude <pattern>...] limit the services)".to_string();
+    let usage = || "usage: strig update [-i] [--major] [--outdated [--deployed]] [--deploy] --check|--pin|(plain) <stack>|--all   [--commit|--branch|--single-branch[=<name>]|--push|--pr] [--include <pattern>...] [--exclude <pattern>...] limit the services)".to_string();
     // `--include/--exclude <pattern>` (repeatable) are taken out first so their values are not mistaken for the stack
     let (mut inc, mut exc, mut rest, mut it) = (vec![], vec![], vec![], a.iter());
     while let Some(x) = it.next() {
@@ -291,6 +295,10 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
     let mode = if has("--check") { Mode::Check } else if has("--pin") { Mode::Pin } else { Mode::Update };
     let inter = has("-i") || has("--interactive");
     let dep = has("--deploy");
+    let outdated = has("--outdated");
+    let deployed = has("--deployed");
+    if deployed && !(outdated && mode == Mode::Check) { return Err("--deployed needs --check --outdated".into()); }
+    if outdated && mode == Mode::Pin { return Err("--outdated does not work with --pin".into()); }
     if inter && mode != Mode::Update { return Err("-i/--interactive only works with a plain update (not --check/--pin)".into()); }
     if dep && mode != Mode::Update { return Err("--deploy only works with a plain update (not --check/--pin)".into()); }
     let name = a.iter().find(|x| !x.starts_with('-'));
@@ -316,6 +324,7 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
     }
     let want0 = |st: &str, sv: &str| { let k = format!("{st}/{sv}"); (inc.is_empty() || inc.iter().any(|p| glob(p, &k))) && !exc.iter().any(|p| glob(p, &k)) };
     let mut rc = 0;
+    let (mut n_upd, mut n_stk, mut n_lat, mut n_maj, mut n_skp) = (0, 0, 0, 0, 0); // for the --outdated summary
     let date = String::from_utf8_lossy(&Command::new("date").arg("+%Y%m%d").output().map_err(|e| e.to_string())?.stdout).trim().to_string();
     let shared = single_on.then(|| single.clone().unwrap_or(format!("strig/update-{date}")));
     let def = if branch || single_on { Some(crate::gitops::default_branch(&root)?) } else { None };
@@ -337,11 +346,12 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         let mut env: Option<Result<(String, bool), String>> = None;
         let mut notes: Vec<String> = vec![]; // one line per changed service, for the commit body
         let mut chg: Vec<(String, Option<String>)> = vec![]; // (variable, new value) per image that uses it
+        let upd0 = n_upd;
         let new = map_images(&text, |sv, img| {
             if quit || !want(sv) { return None; }
             let who = format!("{:14} {sv:w$}", s.name);
-            if !header { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); }
-            let skip = |why: &str| { let m = format!("{who} {img:wi$}  skipped ({why})"); if inter { eprintln!("{m}"); } else { println!("{m}"); } };
+            if !header && !outdated { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); }
+            let mut skip = |why: &str| { if outdated { n_skp += 1; return; } let m = format!("{who} {img:wi$}  skipped ({why})"); if inter { eprintln!("{m}"); } else { println!("{m}"); } };
             // `repo:${VAR}`: the version lives in the stack's .env (default as fallback), so that is what is checked and changed
             let var = split_var(img);
             if var.is_none() && img.contains('$') { skip("variable"); return None; }
@@ -363,11 +373,27 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
                 Some(v) => { chg.push((v.name.to_string(), n.and_then(|n| n.strip_prefix(v.pre)?.strip_suffix(v.post).map(String::from)))); None }
             };
             match resolve(&plain, mode, has("--major")) {
-                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => { if c.is_some() { notes.push(format!("- {sv}: {note}")); } fin(c) } Err(()) => { quit = true; None } },
-                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); if n.is_some() { notes.push(format!("- {sv}: {note}")); } fin(n) }
+                // `latest` or a digest pin is only an update/drift if the host's pulled digest differs from the registry's/pinned one
+                Ok((_, note, k)) if deployed && (k == Kind::Latest || (k == Kind::Same && split_ref(&plain).2.is_some())) => {
+                    let (reg, what) = match split_ref(&plain).2 { Some(d) => (d, "pinned"), None => (note.rsplit(' ').next().unwrap_or("").to_string(), "latest") };
+                    let local = ssh.get(&s.host).ok_or(format!("no ssh target for host {}", s.host)).and_then(|t| run_on(t, &format!("docker image inspect --format '{{{{range .RepoDigests}}}}{{{{println .}}}}{{{{end}}}}' '{}'", split_ref(&plain).0 + ":" + split_ref(&plain).1.as_deref().unwrap_or("latest"))));
+                    let msg = match local {
+                        Ok(l) if l.contains(&reg) => None,
+                        Ok(l) => Some(format!("{what}, deployed {} -> registry {reg}", l.lines().next().and_then(|x| x.rsplit('@').next()).unwrap_or("none"))),
+                        // image never pulled on the host: a deploy would fetch something new
+                        Err(e) if e.contains("No such image") || e.contains("No such object") => Some(format!("{what}, not pulled on host -> registry {reg}")),
+                        Err(e) => { eprintln!("{who} {img}  error: {}", e.lines().last().unwrap_or("")); errs += 1; None }
+                    };
+                    if let Some(m) = msg { n_upd += 1; if !header { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); } println!("{who} {img:wi$}  {m}"); }
+                    None
+                }
+                Ok((_, _, k)) if outdated && k != Kind::Upd => { if k == Kind::Latest { n_lat += 1; } else if k == Kind::Major { n_maj += 1; } None }
+                Ok((n, note, _)) if inter => { n_upd += 1; match choose(&who, img, n.as_deref(), &note) { Ok(c) => { if c.is_some() { notes.push(format!("- {sv}: {note}")); } fin(c) } Err(()) => { quit = true; None } } },
+                Ok((n, note, _)) => { n_upd += 1; if !header { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); } println!("{who} {img:wi$}  {note}"); if n.is_some() { notes.push(format!("- {sv}: {note}")); } fin(n) }
                 Err(e) => { eprintln!("{who} {img}  error: {e}"); errs += 1; None }
             }
         });
+        if n_upd > upd0 { n_stk += 1; }
         if quit { eprintln!("aborted, {} not written", s.name); return Ok(1); }
         if errs > 0 { rc = 1; if mode != Mode::Check { eprintln!("{}: skipped", s.name); } continue; }
         // one value per variable: changed only if every image using it agrees
@@ -450,6 +476,14 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
             if pr { println!("PR: {}", crate::gitops::pr(&root, d, b, "chore: update images", &format!("Updated by `strig update --all --single-branch`; one commit per stack."))?); }
         }
         crate::gitops::git(&root, &["switch", d])?;
+    }
+    if outdated {
+        let mut extra = vec![];
+        if n_maj > 0 { extra.push(format!("{n_maj} with major update (use --major)")); }
+        if n_lat > 0 { extra.push(format!("{n_lat} on latest, not comparable")); }
+        if n_skp > 0 { extra.push(format!("{n_skp} skipped")); }
+        let head = if n_upd == 0 { "all up to date".to_string() } else { format!("{n_upd} updates in {n_stk} stacks") };
+        println!("{head}{}", if extra.is_empty() { String::new() } else { format!(" ({})", extra.join(", ")) });
     }
     Ok(rc)
 }
