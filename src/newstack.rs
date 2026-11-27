@@ -55,12 +55,24 @@ fn insert_service(text: &str, block: &str, proxied: bool) -> Result<String, Stri
     Ok(out)
 }
 
-fn vault(root: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
+pub(crate) fn vault(root: &Path, args: &[&str], input: Option<&str>) -> Result<String, String> {
     let mut c = Command::new("ansible-vault").current_dir(root).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("ansible-vault: {e}"))?;
     c.stdin.take().unwrap().write_all(input.unwrap_or("").as_bytes()).map_err(|e| e.to_string())?;
     let o = c.wait_with_output().map_err(|e| e.to_string())?;
     if !o.status.success() { return Err(format!("ansible-vault {}: {}", args[0], String::from_utf8_lossy(&o.stderr).trim())); }
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// `strig env <view|edit> <stack>`: show or edit the vault-encrypted stacks/<stack>/.env (interactive, inherits the terminal).
+pub(crate) fn env(a: &[String]) -> Result<(), String> {
+    let usage = "usage: strig env <view|edit> <stack>";
+    let (Some(m @ ("view" | "edit")), Some(stack), 2) = (a.first().map(String::as_str), a.get(1), a.len()) else { return Err(usage.into()) };
+    if !ident(stack) { return Err(format!("bad stack name `{stack}`")); }
+    let r = ops::root();
+    let p = r.join("stacks").join(stack).join(".env");
+    if !p.exists() { return Err(format!("{} does not exist", p.display())); }
+    let s = Command::new("ansible-vault").current_dir(&r).args([m, &p.to_string_lossy()]).status().map_err(|e| format!("ansible-vault: {e}"))?;
+    if s.success() { Ok(()) } else { Err(format!("ansible-vault {m} failed")) }
 }
 
 /// Existing (decrypted) .env of the stack plus every missing credential token of `text`. FQDN/URL tokens need `domain`. Existing values are never changed.

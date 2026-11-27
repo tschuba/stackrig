@@ -71,6 +71,7 @@ fn main() {
         Some("mv" | "move") => exit(mvstack::mv(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
         Some("new") => exit(newstack::new(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
         Some("add") => exit(newstack::add(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
+        Some("env") => exit(newstack::env(&a[2..]).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
         Some("domain") => exit(domain::domain(&a[2..], dry).map_or_else(|e| { eprintln!("error: {e}"); 2 }, |_| 0)),
         Some("deploy") => exit(ops::deploy(&a[2..]).unwrap_or_else(|e| { eprintln!("error: {e}"); 2 })),
         _ => {}
