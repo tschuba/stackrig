@@ -276,7 +276,7 @@ fn glob(p: &str, t: &str) -> bool {
 }
 
 pub(crate) fn update(a: &[String]) -> Result<i32, String> {
-    let usage = || "usage: strig update [-i] [--major] [--deploy] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all   [--include <pattern>...] [--exclude <pattern>...] limit the services)".to_string();
+    let usage = || "usage: strig update [-i] [--major] [--deploy] --check|--pin|(plain) <stack>|--all   [--commit|--branch|--single-branch[=<name>]|--push|--pr] [--include <pattern>...] [--exclude <pattern>...] limit the services)".to_string();
     // `--include/--exclude <pattern>` (repeatable) are taken out first so their values are not mistaken for the stack
     let (mut inc, mut exc, mut rest, mut it) = (vec![], vec![], vec![], a.iter());
     while let Some(x) = it.next() {
@@ -294,7 +294,16 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
     if inter && mode != Mode::Update { return Err("-i/--interactive only works with a plain update (not --check/--pin)".into()); }
     if dep && mode != Mode::Update { return Err("--deploy only works with a plain update (not --check/--pin)".into()); }
     let name = a.iter().find(|x| !x.starts_with('-'));
-    if name.is_none() && !has("--all") && mode != Mode::Check { return Err(usage()); }
+    if name.is_none() == !has("--all") { return Err(usage()); }
+    let single = a.iter().find_map(|x| x.strip_prefix("--single-branch=").map(String::from));
+    let single_on = single.is_some() || has("--single-branch");
+    let (branch, pr) = (has("--branch"), has("--pr"));
+    let push = has("--push") || pr;
+    let commit = has("--commit") || branch || single_on;
+    if (commit || push) && mode == Mode::Check { return Err("--commit/--branch/--single-branch/--push/--pr do not work with --check".into()); }
+    if branch && single_on { return Err("--branch and --single-branch cannot be combined".into()); }
+    if single_on && name.is_some() { return Err("--single-branch needs --all (for one stack use --branch)".into()); }
+    if push && !branch && !single_on { return Err("--push/--pr need --branch or --single-branch".into()); }
     let root = ops::root();
     let (stacks, ssh) = ops::load(&root)?;
     let targets: Vec<_> = stacks.iter().filter(|s| name.is_none_or(|n| *n == s.name)).collect();
@@ -307,6 +316,14 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
     }
     let want0 = |st: &str, sv: &str| { let k = format!("{st}/{sv}"); (inc.is_empty() || inc.iter().any(|p| glob(p, &k))) && !exc.iter().any(|p| glob(p, &k)) };
     let mut rc = 0;
+    let date = String::from_utf8_lossy(&Command::new("date").arg("+%Y%m%d").output().map_err(|e| e.to_string())?.stdout).trim().to_string();
+    let shared = single_on.then(|| single.clone().unwrap_or(format!("strig/update-{date}")));
+    let def = if branch || single_on { Some(crate::gitops::default_branch(&root)?) } else { None };
+    if let Some(d) = &def {
+        let names: Vec<String> = match &shared { Some(b) => vec![b.clone()], None => targets.iter().map(|s| format!("strig/update-{}-{date}", s.name)).collect() };
+        crate::gitops::preflight(&root, d, &names)?;
+    }
+    let mut on_shared = false; // the shared branch is created lazily, at the first stack with changes
     for s in targets {
         let want = |sv: &str| want0(&s.name, sv);
         let dir = root.join("stacks").join(&s.name);
@@ -318,6 +335,7 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         map_images(&text, |sv, i| { if want(sv) { w = w.max(sv.len() + 1); wi = wi.max(i.len()); } None });
         let mut header = inter;
         let mut env: Option<Result<(String, bool), String>> = None;
+        let mut notes: Vec<String> = vec![]; // one line per changed service, for the commit body
         let mut chg: Vec<(String, Option<String>)> = vec![]; // (variable, new value) per image that uses it
         let new = map_images(&text, |sv, img| {
             if quit || !want(sv) { return None; }
@@ -345,8 +363,8 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
                 Some(v) => { chg.push((v.name.to_string(), n.and_then(|n| n.strip_prefix(v.pre)?.strip_suffix(v.post).map(String::from)))); None }
             };
             match resolve(&plain, mode, has("--major")) {
-                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => fin(c), Err(()) => { quit = true; None } },
-                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); fin(n) }
+                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => { if c.is_some() { notes.push(format!("- {sv}: {note}")); } fin(c) } Err(()) => { quit = true; None } },
+                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); if n.is_some() { notes.push(format!("- {sv}: {note}")); } fin(n) }
                 Err(e) => { eprintln!("{who} {img}  error: {e}"); errs += 1; None }
             }
         });
@@ -362,23 +380,41 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         }
         let (mut envt, enc) = match env { Some(Ok(x)) => x, _ => (String::new(), false) };
         if mode == Mode::Check { continue; }
+        let files = !set.is_empty() || new != text;
+        let fl = if files { "files changed" } else { "files unchanged" };
+        let rel = |f: &std::path::Path| f.strip_prefix(&root).unwrap_or(f).to_string_lossy().into_owned();
+        let mut changed: Vec<String> = vec![];
+        if !set.is_empty() { changed.push(rel(&dir.join(".env"))); }
+        if new != text { changed.push(rel(&file)); }
+        let (mut own, mut committed) = (None::<String>, false);
+        if commit && files {
+            if crate::gitops::dirty(&root, &changed)? { eprintln!("{}: {} has uncommitted changes, skipped", s.name, changed.join(", ")); rc = 1; continue; }
+            if branch { let b = format!("strig/update-{}-{date}", s.name); crate::gitops::git(&root, &["switch", "-c", &b])?; own = Some(b); }
+            else if let (Some(b), false) = (&shared, on_shared) { crate::gitops::git(&root, &["switch", "-c", b])?; on_shared = true; }
+        }
         if !set.is_empty() {
             for (n, v) in &set { envt = env_set(&envt, n, v); }
             env_write(&root, &dir, &envt, enc)?;
             println!("{:14} [1/4] files   {} written ({}; review and commit)", s.name, dir.join(".env").display(), set.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(", "));
         }
         if new != text { std::fs::write(&file, &new).map_err(|e| e.to_string())?; println!("{:14} [1/4] files   {} written (review and commit)", s.name, file.display()); }
-        let files = !set.is_empty() || new != text;
-        let fl = if files { "files changed" } else { "files unchanged" };
-        if mode == Mode::Pin { continue; }
+        let title = format!("chore({}): {}", s.name, if mode == Mode::Pin { "pin image digests" } else { "update images" });
+        if commit && files {
+            crate::gitops::commit(&root, &changed, &format!("{title}\n\n{}", notes.join("\n")))?;
+            committed = true;
+            println!("{:14} committed: {title}", s.name);
+        }
+        let rc0 = rc;
+        'done: {
+        if mode == Mode::Pin { break 'done; }
         // safety: without --deploy (or -i, which asks) nothing touches the host
-        if !dep && !inter { println!("{:14} {fl}, NOT deployed; run: strig deploy {} (or update with --deploy)", s.name, s.name); continue; }
+        if !dep && !inter { println!("{:14} {fl}, NOT deployed; run: strig deploy {} (or update with --deploy)", s.name, s.name); break 'done; }
         let t = ssh.get(&s.host).ok_or(format!("no ssh target for host {}", s.host))?;
         let mut imgs = vec![];
         map_images(&new, |sv, i| { if want(sv) { match split_var(i) { Some(v) => if let Some(c) = env_get(&envt, v.name).or(v.def.map(String::from)) { imgs.push(format!("{}{c}{}", v.pre, v.post)); }, None if !i.contains('$') => imgs.push(i.to_string()), _ => {} } } None });
         imgs.sort(); imgs.dedup(); // services sharing an image are pulled once
         println!("{:14} plan: on {t}: pull {} image(s), ansible-playbook --limit {} -e only={}, health check up to 120 s", s.name, imgs.len(), s.host, s.name);
-        if inter && !dep && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} {fl}, NOT deployed", s.name); continue; }
+        if inter && !dep && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} {fl}, NOT deployed", s.name); break 'done; }
         for (n, i) in imgs.iter().enumerate() {
             println!("{:14} [2/4] pull    {i} ({}/{})", s.name, n + 1, imgs.len());
             let t0 = std::time::Instant::now();
@@ -389,13 +425,31 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         }
         println!("{:14} [3/4] deploy  ansible-playbook --limit {} -e only={}", s.name, s.host, s.name);
         let c = ops::deploy(&[s.name.clone()])?;
-        if c != 0 { eprintln!("{}: {fl}, deploy FAILED (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; continue; }
+        if c != 0 { eprintln!("{}: {fl}, deploy FAILED (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; break 'done; }
         println!("{:14} [4/4] health  waiting (max 120 s)", s.name);
         let t0 = std::time::Instant::now();
         match health(t, &s.name, 10, 120, 5) {
             Ok(()) => println!("{:14} [4/4] health  healthy ({} s)\n{:14} {fl}, deployed, healthy", s.name, t0.elapsed().as_secs(), s.name),
             Err(e) => { eprintln!("{e}\n{}: {fl}, deployed, NOT healthy; roll back: git revert, then `strig deploy {}`", s.name, s.name); rc = 1; }
         }
+        }
+        // only a tested state is published (a failed deploy/health check leaves the commit local)
+        if let (Some(b), Some(d)) = (&own, &def) {
+            if push && committed && rc == rc0 {
+                crate::gitops::push(&root, b)?;
+                println!("{:14} pushed {b}", s.name);
+                if pr { println!("{:14} PR: {}", s.name, crate::gitops::pr(&root, d, b, &title, &notes.join("\n"))?); }
+            }
+            crate::gitops::git(&root, &["switch", d])?;
+        }
+    }
+    if let (true, Some(b), Some(d)) = (on_shared, &shared, &def) {
+        if push && rc == 0 {
+            crate::gitops::push(&root, b)?;
+            println!("pushed {b}");
+            if pr { println!("PR: {}", crate::gitops::pr(&root, d, b, "chore: update images", &format!("Updated by `strig update --all --single-branch`; one commit per stack."))?); }
+        }
+        crate::gitops::git(&root, &["switch", d])?;
     }
     Ok(rc)
 }
