@@ -14,6 +14,7 @@ COMMANDS:
     update      Check for newer image tags, pin digests, update a stack (pull, deploy, health check)
     new         Create a homelab stack (compose.yml, meta.yml, vault .env, host_vars)
     add         Add a service to a homelab stack
+    env         View or edit the vault-encrypted .env of a stack
     mv, move    Move a homelab stack to another host (host_vars entry)
     domain      Add or remove a domain of a homelab stack (meta.yml + Traefik rule)
     deploy      Run Ansible for one stack or host
@@ -148,19 +149,23 @@ Compares Git with what runs on each host; prints one line per finding, or `no dr
     differs   ~/homelab/stacks/<n>/compose.yml on the host is missing or != compose.yml in Git (only compose.yml is compared)
 
 Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a warning.",
-        "update" => "strig update [-i|--interactive] [--major] [--service <name>...] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
+        "update" => "strig update [-i|--interactive] [--deploy] [--major] [--include <pattern>...] [--exclude <pattern>...] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
 
     --check            Show newer tags (same format: prefix, suffix, number of parts) and the registry digest of `latest`. Writes nothing.
     -i, --interactive  Interactive (plain update only): per image `Y` apply, `n` keep, a tag to use that version instead (checked in
                        the registry), `q` abort (nothing written). Images without a newer tag can be changed by typing a tag, too.
                        Afterwards asks before deploying. Prompts go to stderr.
-    --service <name>   Only this service of <stack> (repeatable; not with --all). Edits, pulls and checks only its image;
-                       the deploy and the health check still cover the whole stack (compose restarts only what changed).
+    --include <pattern>  Only matching services (repeatable). <pattern> is `service` or `stack/service`; `*` matches any text, quote it
+                       (`'db*'`). A pattern without `*` that matches nothing is an error. Works with --all.
+    --exclude <pattern>  Skip matching services (repeatable, wins over --include). Only matching images are edited, pulled and
+                       checked; the deploy and the health check still cover the whole stack (compose restarts only what changed).
+    --deploy           Also deploy after writing the files (pull, Ansible, health check). Without it (and without -i) only the files
+                       change and the output says `NOT deployed; run: strig deploy <stack>`. With -i the deploy is asked instead.
     --major            Also take major jumps. Default: stay in the same major (for 0.x the first non-zero part counts: 0.21.x stays 0.21.x);
                        a higher one is only shown as `(major available: ...)`.
     --pin              Rewrite `latest`/untagged images to repo:<tag>@sha256:<digest> (tag found by digest among the 20 newest
                        plain version tags; else repo:latest@sha256:...). Edits compose.yml only, you commit.
-    <stack>|--all      Bump fixed tags to the newest one in compose.yml, `docker pull` all images on the host, `strig deploy`
+    <stack>|--all      Bump fixed tags to the newest one in compose.yml; with --deploy also `docker pull` all images on the host, `strig deploy`
                        (Ansible), then wait up to 120 s for health: Docker healthcheck, else running without restarts.
                        Exit 1 on failure; no automatic rollback (git revert + `strig deploy`). No backup yet.
                        Images with `${VAR}` are listed as `skipped (variable)` and never changed or pulled; a downgrade (typed tag older than current) is not reported.
@@ -183,6 +188,9 @@ Creates stacks/<name>/ (compose.yml with Traefik labels in the format of the exi
 and appends the stack to host_vars/<host>/stacks.yml. SERVICE_PASSWORD_*/USER_*/BASE64_* ... used in the compose text are generated into
 .env, SERVICE_FQDN_*/URL_* are set from --domain; existing values are never overwritten. Needs ansible-vault and .vault-pass.
 Asks before `strig deploy <name>` (--yes: deploy without asking). Refuses existing stacks and domains used elsewhere.",
+        "env" => "strig env <view|edit> <stack>
+
+Runs `ansible-vault view|edit` on stacks/<stack>/.env in the homelab repo (or STRIG_HOME). `edit` re-encrypts on save. Needs ansible-vault and .vault-pass.",
         "add" => "strig add <stack> <service> --image <image> [--domain <domain> [--port 80]] [--env K=V]... [--yes] [--dry-run]
 
 Appends a service to stacks/<stack>/compose.yml (with --domain: Traefik labels, `proxy` network, domain in meta.yml).

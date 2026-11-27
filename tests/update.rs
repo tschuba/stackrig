@@ -73,28 +73,57 @@ fn check_prints_header_and_service_column() {
 }
 
 #[test]
-fn variable_images_are_listed_as_skipped_and_never_rewritten() {
+fn variable_versions_are_read_from_and_written_to_env() {
     let e = Env::new("var");
-    let c = "services:\n  x:\n    image: o/x:${TAG:-1.0.0}\n  y:\n    image: o/y:1.0.0\n";
+    let c = "services:\n  x:\n    image: o/x:${TAG}\n  y:\n    image: o/y:${TAG}\n  z:\n    image: o/z:${NOPE}\n  w:\n    image: o/w:${D:-1.0.0}\n";
     fs::write(e.root.join("stacks/a/compose.yml"), c).unwrap();
+    let env = e.root.join("stacks/a/.env");
+    fs::write(&env, "A=1\nTAG=1.0.0\n").unwrap();
     let s = String::from_utf8_lossy(&e.run(&["--check", "a"], "").stdout).into_owned();
-    assert!(s.contains("o/x:${TAG:-1.0.0}") && s.contains("skipped (variable)"), "{s}");
-    assert!(s.contains("o/y:1.0.0") && s.contains("1.0.0 -> 1.1.0"), "{s}");
-    let o = e.run(&["--pin", "a"], "");
-    assert!(String::from_utf8_lossy(&o.stdout).contains("skipped (variable)") && e.compose().contains("o/x:${TAG:-1.0.0}"), "{}", err(&o));
+    assert!(s.contains("o/x:${TAG}") && s.contains("1.0.0 -> 1.1.0") && s.contains("o/z:${NOPE}") && s.contains("skipped (variable)"), "{s}");
+    assert_eq!(fs::read_to_string(&env).unwrap(), "A=1\nTAG=1.0.0\n", "check writes nothing");
+    let o = e.run(&["a"], "");
+    assert_eq!(fs::read_to_string(&env).unwrap(), "A=1\nTAG=1.1.0\nD=1.1.0\n", "{}", err(&o));
+    assert_eq!(e.compose(), c, "compose stays");
 }
 
 #[test]
-fn service_limits_check_and_update_to_that_service() {
+fn shared_variable_with_different_results_is_left_alone() {
+    let e = Env::new("shared");
+    fs::write(e.root.join("stacks/a/compose.yml"), "services:\n  x:\n    image: o/x:${T}\n  y:\n    image: o/y:${T}-alpine\n").unwrap();
+    let env = e.root.join("stacks/a/.env");
+    fs::write(&env, "T=1.0.0\n").unwrap();
+    let o = e.run(&["a"], "");
+    assert_eq!(fs::read_to_string(&env).unwrap(), "T=1.0.0\n");
+    assert!(err(&o).contains("different results"), "{}", err(&o));
+}
+
+#[test]
+fn unreadable_env_skips_in_check_and_fails_on_update() {
+    let e = Env::new("vault");
+    fs::write(e.root.join("stacks/a/compose.yml"), "services:\n  x:\n    image: o/x:${T}\n").unwrap();
+    fs::write(e.root.join("stacks/a/.env"), "$ANSIBLE_VAULT;1.1;AES256\nabc\n").unwrap();
+    // no ansible-vault in PATH-less env is not guaranteed, so either way decrypt must fail on this junk
+    let o = e.run(&["--check", "a"], "");
+    assert!(String::from_utf8_lossy(&o.stdout).contains(".env not readable") && o.status.success(), "{}", err(&o));
+    let o = e.run(&["a"], "");
+    assert!(err(&o).contains(".env not readable") && !o.status.success());
+}
+
+#[test]
+fn include_exclude_limit_check_and_update_to_that_service() {
     let e = Env::new("svc");
-    let o = e.run(&["--check", "a", "--service", "y"], "");
+    let o = e.run(&["--check", "a", "--include", "y"], "");
     let s = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(s.contains("o/y:1.0.0") && !s.contains("o/x:"), "{s}");
     // interactive: only y is asked (custom tag), x stays; deploy: n
-    let o = e.run(&["-i", "--service", "y", "a"], "1.0.1\nn\n");
+    let o = e.run(&["-i", "--exclude", "x", "a"], "1.0.1\nn\n");
     assert_eq!(e.compose(), "services:\n  x:\n    image: o/x:1.0.0\n  y:\n    image: o/y:1.0.1\n", "{}", err(&o));
-    // bad usage: unknown service, --all, no stack
-    for args in [&["a", "--service", "nope"][..], &["--all", "--service", "y"], &["--service", "y"]] {
+    // bad usage: unknown service, missing value
+    assert!(err(&e.run(&["a", "--include", "nope"], "")).contains("matches no service"));
+    let o = e.run(&["--check", "--all", "--exclude", "*/x"], "");
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("o/x:"));
+    for args in [&["a", "--exclude"][..]] {
         assert_eq!(e.run(args, "").status.code(), Some(2), "{args:?}");
     }
 }
@@ -128,4 +157,13 @@ fn ls_sorts_by_shown_columns_in_order() {
     assert_eq!(t.lines().skip(1).map(|l| l.split_whitespace().last().unwrap()).collect::<Vec<_>>(), ["x", "y"], "{t}");
     let o = Command::new(env!("CARGO_BIN_EXE_strig")).args(["ls", "--show", "tag,service"]).env("STRIG_HOME", &e.root).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout).lines().nth(2).unwrap().trim(), "y", "tag 1.0.0 repeats, so it is blanked");
+}
+
+#[test]
+fn plain_update_changes_files_but_does_not_deploy() {
+    let e = Env::new("nodeploy");
+    let o = e.run(&["a"], "");
+    let s = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(e.compose().contains("o/x:1.1.0") && s.contains("NOT deployed") && !s.contains("[2/4]"), "{s}{}", err(&o));
+    assert_eq!(e.run(&["--check", "--deploy", "a"], "").status.code(), Some(2));
 }

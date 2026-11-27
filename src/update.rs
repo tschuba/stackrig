@@ -163,6 +163,50 @@ fn map_images(text: &str, mut f: impl FnMut(&str, &str) -> Option<String>) -> St
     }).collect()
 }
 
+/// An image whose tag is a variable: `repo:${VAR}`, `repo:${VAR:-default}` or `repo:${VAR-default}`, optionally followed by a suffix (`-alpine`).
+struct Var<'a> { pre: &'a str, name: &'a str, def: Option<&'a str>, post: &'a str }
+
+fn split_var(img: &str) -> Option<Var<'_>> {
+    let s = img.find("${")?;
+    let e = s + img[s..].find('}')?;
+    let inner = &img[s + 2..e];
+    let name = &inner[..inner.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(inner.len())];
+    let rest = &inner[name.len()..];
+    let def = if rest.is_empty() { None } else { Some(rest.strip_prefix(":-").or(rest.strip_prefix('-'))?) };
+    let (pre, post) = (&img[..s], &img[e + 1..]);
+    // the variable must sit in the tag (after the last `/`), and nothing else may be a variable
+    (!name.is_empty() && pre.ends_with(':') && pre.rfind('/') < pre.rfind(':') && ![pre, post, def.unwrap_or("")].iter().any(|x| x.contains('$')))
+        .then_some(Var { pre, name, def, post })
+}
+
+/// Value of `name` in `.env` text (surrounding quotes removed).
+fn env_get(text: &str, name: &str) -> Option<String> {
+    crate::secrets::parse_env(text).into_iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.trim_matches(['"', '\'']).to_string())
+}
+
+/// Sets `name=value` in `.env` text: replaces the line or appends one.
+fn env_set(text: &str, name: &str, value: &str) -> String {
+    let line = format!("{name}={value}");
+    if text.lines().any(|l| l.split_once('=').is_some_and(|(k, _)| k == name)) {
+        return text.lines().map(|l| if l.split_once('=').is_some_and(|(k, _)| k == name) { line.clone() } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n";
+    }
+    format!("{text}{}{line}\n", if text.is_empty() || text.ends_with('\n') { "" } else { "\n" })
+}
+
+/// Text of `<stack>/.env` and whether it is vault-encrypted (a missing file counts as empty and plain).
+fn env_read(root: &std::path::Path, dir: &std::path::Path) -> Result<(String, bool), String> {
+    let p = dir.join(".env");
+    if !p.exists() { return Ok((String::new(), false)); }
+    let t = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    if !t.starts_with("$ANSIBLE_VAULT") { return Ok((t, false)); }
+    crate::newstack::vault(root, &["decrypt", "--output", "-", &p.to_string_lossy()], None).map(|t| (t, true))
+}
+
+fn env_write(root: &std::path::Path, dir: &std::path::Path, text: &str, enc: bool) -> Result<(), String> {
+    let p = dir.join(".env");
+    if enc { crate::newstack::vault(root, &["encrypt", "--output", &p.to_string_lossy(), "-"], Some(text)).map(|_| ()) } else { std::fs::write(p, text).map_err(|e| e.to_string()) }
+}
+
 // ---- interactive ----
 
 /// Reads one trimmed line from stdin; EOF counts as `q`.
@@ -200,6 +244,7 @@ fn choose(who: &str, img: &str, proposal: Option<&str>, note: &str) -> Result<Op
 fn health(t: &str, n: &str, min: u64, max: u64, poll: u64) -> Result<(), String> {
     let cmd = r#"for c in $(docker ps -aq --filter label=com.docker.compose.project=__N__); do docker inspect --format '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' $c; done"#.replace("__N__", n);
     let start = std::time::Instant::now();
+    let mut shown = 0;
     let mut first: std::collections::BTreeMap<String, String> = Default::default();
     loop {
         let o = run_on(t, &cmd)?;
@@ -215,35 +260,55 @@ fn health(t: &str, n: &str, min: u64, max: u64, poll: u64) -> Result<(), String>
         let el = start.elapsed().as_secs();
         if bad.is_empty() && el >= min { return Ok(()); }
         if el >= max { return Err(format!("{n}: not healthy after {max} s: {}", bad.join(", "))); }
+        if !bad.is_empty() && el / 15 > shown { shown = el / 15; println!("{n:14} [4/4] health  waiting ({el} s): {}", bad.join(", ")); }
         std::thread::sleep(std::time::Duration::from_secs(poll));
     }
 }
 
 // ---- command ----
 
+/// `*` matches any run of characters (also `/`); everything else literally
+fn glob(p: &str, t: &str) -> bool {
+    match p.split_once('*') {
+        None => p == t,
+        Some((h, r)) => t.strip_prefix(h).is_some_and(|t| (0..=t.len()).filter(|i| t.is_char_boundary(*i)).any(|i| glob(r, &t[i..]))),
+    }
+}
+
 pub(crate) fn update(a: &[String]) -> Result<i32, String> {
-    let usage = || "usage: strig update [-i] [--major] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all   (<stack> [--service <name>...] limits it to some services)".to_string();
-    // `--service <name>` (repeatable) is taken out first so its value is not mistaken for the stack
-    let (mut svcs, mut rest, mut it) = (vec![], vec![], a.iter());
-    while let Some(x) = it.next() { if x == "--service" { svcs.push(it.next().ok_or_else(usage)?.clone()); } else { rest.push(x.clone()); } }
+    let usage = || "usage: strig update [-i] [--major] [--deploy] --check [<stack>|--all] | --pin <stack>|--all | <stack>|--all   [--include <pattern>...] [--exclude <pattern>...] limit the services)".to_string();
+    // `--include/--exclude <pattern>` (repeatable) are taken out first so their values are not mistaken for the stack
+    let (mut inc, mut exc, mut rest, mut it) = (vec![], vec![], vec![], a.iter());
+    while let Some(x) = it.next() {
+        let (list, v) = match x.as_str() {
+            "--include" | "--exclude" => (if x == "--include" { &mut inc } else { &mut exc }, it.next().ok_or_else(usage)?.clone()),
+            _ => { rest.push(x.clone()); continue }
+        };
+        list.push(if v.contains('/') { v } else { format!("*/{v}") });
+    }
     let a = &rest[..];
     let has = |f: &str| a.iter().any(|x| x == f);
     let mode = if has("--check") { Mode::Check } else if has("--pin") { Mode::Pin } else { Mode::Update };
     let inter = has("-i") || has("--interactive");
+    let dep = has("--deploy");
     if inter && mode != Mode::Update { return Err("-i/--interactive only works with a plain update (not --check/--pin)".into()); }
+    if dep && mode != Mode::Update { return Err("--deploy only works with a plain update (not --check/--pin)".into()); }
     let name = a.iter().find(|x| !x.starts_with('-'));
     if name.is_none() && !has("--all") && mode != Mode::Check { return Err(usage()); }
     let root = ops::root();
     let (stacks, ssh) = ops::load(&root)?;
     let targets: Vec<_> = stacks.iter().filter(|s| name.is_none_or(|n| *n == s.name)).collect();
     if targets.is_empty() { return Err(format!("unknown stack `{}`", name.unwrap())); }
-    if !svcs.is_empty() {
-        let Some(n) = name.filter(|_| !has("--all")) else { return Err("--service needs exactly one <stack> (not --all)".into()) };
-        if let Some(bad) = svcs.iter().find(|v| !targets[0].services.iter().any(|(sv, _, _)| sv == *v)) { return Err(format!("stack `{n}` has no service `{bad}` with an image")); }
+    // a pattern without `*` that matches nothing is a typo (error); with `*` it only warns
+    for p in inc.iter().chain(&exc) {
+        if targets.iter().any(|t| t.services.iter().any(|(sv, _, _)| glob(p, &format!("{}/{sv}", t.name)))) { continue; }
+        if !p.contains('*') { return Err(format!("no service `{p}` with an image in the selected stacks")); }
+        eprintln!("warning: pattern `{p}` matches no service");
     }
-    let want = |sv: &str| svcs.is_empty() || svcs.iter().any(|x| x == sv);
+    let want0 = |st: &str, sv: &str| { let k = format!("{st}/{sv}"); (inc.is_empty() || inc.iter().any(|p| glob(p, &k))) && !exc.iter().any(|p| glob(p, &k)) };
     let mut rc = 0;
     for s in targets {
+        let want = |sv: &str| want0(&s.name, sv);
         let dir = root.join("stacks").join(&s.name);
         let Some(file) = ["compose.yml", "compose.yaml", "docker-compose.yml"].iter().map(|f| dir.join(f)).find(|p| p.exists()) else { eprintln!("{}: no compose file", s.name); rc = 1; continue };
         let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
@@ -252,33 +317,84 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
         let (mut w, mut wi) = (7, 5); // service column gets +1 below so names never touch the image
         map_images(&text, |sv, i| { if want(sv) { w = w.max(sv.len() + 1); wi = wi.max(i.len()); } None });
         let mut header = inter;
+        let mut env: Option<Result<(String, bool), String>> = None;
+        let mut chg: Vec<(String, Option<String>)> = vec![]; // (variable, new value) per image that uses it
         let new = map_images(&text, |sv, img| {
             if quit || !want(sv) { return None; }
             let who = format!("{:14} {sv:w$}", s.name);
             if !header { header = true; println!("{:14} {:w$} {:wi$}  CHANGE", "STACK", "SERVICE", "IMAGE"); }
-            // the version is set by a variable (.env / Ansible), so it is not ours to rewrite
-            if img.contains('$') { let m = format!("{who} {img:wi$}  skipped (variable)"); if inter { eprintln!("{m}"); } else { println!("{m}"); } return None; }
-            match resolve(img, mode, has("--major")) {
-                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => c, Err(()) => { quit = true; None } },
-                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); n }
+            let skip = |why: &str| { let m = format!("{who} {img:wi$}  skipped ({why})"); if inter { eprintln!("{m}"); } else { println!("{m}"); } };
+            // `repo:${VAR}`: the version lives in the stack's .env (default as fallback), so that is what is checked and changed
+            let var = split_var(img);
+            if var.is_none() && img.contains('$') { skip("variable"); return None; }
+            let plain = match &var {
+                None => img.to_string(),
+                Some(v) => {
+                    let cur = match env.get_or_insert_with(|| env_read(&root, &dir)) {
+                        Ok((t, _)) => env_get(t, v.name).or(v.def.map(String::from)),
+                        Err(e) if mode == Mode::Check => { skip(&format!("variable: .env not readable: {}", e.lines().last().unwrap_or(""))); return None; }
+                        Err(e) => { eprintln!("{who} {img}  error: .env not readable: {}", e.lines().last().unwrap_or("")); errs += 1; return None; }
+                    };
+                    let Some(cur) = cur else { skip("variable"); return None };
+                    format!("{}{cur}{}", v.pre, v.post)
+                }
+            };
+            // a variable's new value goes to the .env (collected, applied once per variable below); the compose line stays
+            let mut fin = |n: Option<String>| match &var {
+                None => n,
+                Some(v) => { chg.push((v.name.to_string(), n.and_then(|n| n.strip_prefix(v.pre)?.strip_suffix(v.post).map(String::from)))); None }
+            };
+            match resolve(&plain, mode, has("--major")) {
+                Ok((n, note)) if inter => match choose(&who, img, n.as_deref(), &note) { Ok(c) => fin(c), Err(()) => { quit = true; None } },
+                Ok((n, note)) => { println!("{who} {img:wi$}  {note}"); fin(n) }
                 Err(e) => { eprintln!("{who} {img}  error: {e}"); errs += 1; None }
             }
         });
         if quit { eprintln!("aborted, {} not written", s.name); return Ok(1); }
         if errs > 0 { rc = 1; if mode != Mode::Check { eprintln!("{}: skipped", s.name); } continue; }
+        // one value per variable: changed only if every image using it agrees
+        let mut set: Vec<(String, String)> = vec![];
+        for (n, _) in &chg {
+            if set.iter().any(|(x, _)| x == n) { continue; }
+            let vals: Vec<_> = chg.iter().filter(|(x, _)| x == n).map(|x| &x.1).collect();
+            if vals.iter().any(|v| **v != *vals[0]) { eprintln!("{:14} {n}: images using it get different results, not changed", s.name); }
+            else if let Some(v) = vals[0] { set.push((n.clone(), v.clone())); }
+        }
+        let (mut envt, enc) = match env { Some(Ok(x)) => x, _ => (String::new(), false) };
         if mode == Mode::Check { continue; }
-        if new != text { std::fs::write(&file, &new).map_err(|e| e.to_string())?; println!("{:14} {} written (review and commit)", s.name, file.display()); }
+        if !set.is_empty() {
+            for (n, v) in &set { envt = env_set(&envt, n, v); }
+            env_write(&root, &dir, &envt, enc)?;
+            println!("{:14} [1/4] files   {} written ({}; review and commit)", s.name, dir.join(".env").display(), set.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(", "));
+        }
+        if new != text { std::fs::write(&file, &new).map_err(|e| e.to_string())?; println!("{:14} [1/4] files   {} written (review and commit)", s.name, file.display()); }
+        let files = !set.is_empty() || new != text;
+        let fl = if files { "files changed" } else { "files unchanged" };
         if mode == Mode::Pin { continue; }
-        if inter && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} not deployed", s.name); continue; }
+        // safety: without --deploy (or -i, which asks) nothing touches the host
+        if !dep && !inter { println!("{:14} {fl}, NOT deployed; run: strig deploy {} (or update with --deploy)", s.name, s.name); continue; }
         let t = ssh.get(&s.host).ok_or(format!("no ssh target for host {}", s.host))?;
         let mut imgs = vec![];
-        map_images(&new, |sv, i| { if want(sv) && !i.contains('$') { imgs.push(i.to_string()); } None });
-        for i in imgs { if let Err(e) = run_on(t, &format!("docker pull '{i}'")) { eprintln!("{}: pull {i} failed: {}", s.name, e.lines().last().unwrap_or("")); } }
+        map_images(&new, |sv, i| { if want(sv) { match split_var(i) { Some(v) => if let Some(c) = env_get(&envt, v.name).or(v.def.map(String::from)) { imgs.push(format!("{}{c}{}", v.pre, v.post)); }, None if !i.contains('$') => imgs.push(i.to_string()), _ => {} } } None });
+        imgs.sort(); imgs.dedup(); // services sharing an image are pulled once
+        println!("{:14} plan: on {t}: pull {} image(s), ansible-playbook --limit {} -e only={}, health check up to 120 s", s.name, imgs.len(), s.host, s.name);
+        if inter && !dep && !matches!(ask(&format!("{}: deploy now? [Y/n]: ", s.name)).as_str(), "" | "y" | "Y") { println!("{:14} {fl}, NOT deployed", s.name); continue; }
+        for (n, i) in imgs.iter().enumerate() {
+            println!("{:14} [2/4] pull    {i} ({}/{})", s.name, n + 1, imgs.len());
+            let t0 = std::time::Instant::now();
+            match run_on(t, &format!("docker pull '{i}'")) {
+                Ok(_) => println!("{:14} [2/4] pull    done ({} s)", s.name, t0.elapsed().as_secs()),
+                Err(e) => eprintln!("{}: pull {i} failed: {}", s.name, e.lines().last().unwrap_or("")),
+            }
+        }
+        println!("{:14} [3/4] deploy  ansible-playbook --limit {} -e only={}", s.name, s.host, s.name);
         let c = ops::deploy(&[s.name.clone()])?;
-        if c != 0 { eprintln!("{}: deploy failed (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; continue; }
+        if c != 0 { eprintln!("{}: {fl}, deploy FAILED (exit {c}); roll back with git revert and `strig deploy {}`", s.name, s.name); rc = 1; continue; }
+        println!("{:14} [4/4] health  waiting (max 120 s)", s.name);
+        let t0 = std::time::Instant::now();
         match health(t, &s.name, 10, 120, 5) {
-            Ok(()) => println!("{:14} healthy", s.name),
-            Err(e) => { eprintln!("{e}\nroll back: git revert, then `strig deploy {}`", s.name); rc = 1; }
+            Ok(()) => println!("{:14} [4/4] health  healthy ({} s)\n{:14} {fl}, deployed, healthy", s.name, t0.elapsed().as_secs(), s.name),
+            Err(e) => { eprintln!("{e}\n{}: {fl}, deployed, NOT healthy; roll back: git revert, then `strig deploy {}`", s.name, s.name); rc = 1; }
         }
     }
     Ok(rc)
@@ -288,6 +404,10 @@ pub(crate) fn update(a: &[String]) -> Result<i32, String> {
 mod tests {
     use super::*;
     fn v(x: &[&str]) -> Vec<String> { x.iter().map(|s| s.to_string()).collect() }
+    #[test]
+    fn globs() {
+        assert!(glob("*/db", "shop/db") && !glob("*/db", "shop/db2") && glob("shop/*", "shop/x") && glob("a*b*c", "aXbYc") && !glob("a*b", "abc"));
+    }
     #[test]
     fn refs_and_versions() {
         assert_eq!(split_ref("localhost:5000/a/b:1@sha256:x"), ("localhost:5000/a/b".into(), Some("1".into()), Some("sha256:x".into())));
