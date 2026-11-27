@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0](https://github.com/tschuba/stackrig/compare/v1.0.0...v1.1.0) (2026-11-27)
+
+
+### Features
+
+* strig env, update --include/--exclude/--deploy, variable image tags ([#8](https://github.com/tschuba/stackrig/issues/8)) ([2e1324a](https://github.com/tschuba/stackrig/commit/2e1324a5776b53e8cfd073f519ef91da7e13c780))
+* **update:** add --commit, --branch, --single-branch, --push and --pr ([#10](https://github.com/tschuba/stackrig/issues/10)) ([c9973e2](https://github.com/tschuba/stackrig/commit/c9973e2ea5c51023c4f16b8cacf9515de7c35b0e))
+* **update:** add --outdated and --deployed ([#11](https://github.com/tschuba/stackrig/issues/11)) ([849c8d6](https://github.com/tschuba/stackrig/commit/849c8d6bcf70a7e3448fa2075ceb84cee390ce62))
+
+
+### Bug Fixes
+
+* **update:** one header and shared column widths for all modes ([#12](https://github.com/tschuba/stackrig/issues/12)) ([9afe2e3](https://github.com/tschuba/stackrig/commit/9afe2e399801b1d2ecd01cbeb12438c88396a0c3))
+
 ## [1.0.0](https://github.com/tschuba/stackrig/compare/v0.2.0...v1.0.0) (2026-11-25)
 
 
