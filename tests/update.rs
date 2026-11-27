@@ -167,3 +167,144 @@ fn plain_update_changes_files_but_does_not_deploy() {
     assert!(e.compose().contains("o/x:1.1.0") && s.contains("NOT deployed") && !s.contains("[2/4]"), "{s}{}", err(&o));
     assert_eq!(e.run(&["--check", "--deploy", "a"], "").status.code(), Some(2));
 }
+
+fn git(e: &Env, a: &[&str]) -> String {
+    let o = Command::new("git").current_dir(&e.root).args(a).output().unwrap();
+    assert!(o.status.success(), "{a:?}: {}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+fn repo(name: &str) -> Env {
+    let e = Env::new(name);
+    let bare = e.root.join("origin.git");
+    let _ = Command::new("git").args(["init", "-q", "--bare", "-b", "main"]).arg(&bare).status();
+    for a in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"], &["remote", "add", "origin", bare.to_str().unwrap()]] { git(&e, a); }
+    fs::write(e.root.join(".gitignore"), "bin/\norigin.git/\n").unwrap();
+    git(&e, &["add", "."]); git(&e, &["commit", "-qm", "init"]); git(&e, &["push", "-q", "-u", "origin", "main"]);
+    git(&e, &["remote", "set-head", "origin", "main"]);
+    e
+}
+
+#[test]
+fn stack_selection_is_exact() {
+    let e = Env::new("sel");
+    for args in [&["--check"][..], &["--check", "--all", "a"], &["a", "--single-branch"], &["--all", "--branch", "--single-branch"], &["a", "--push"], &["a", "--check", "--commit"]] {
+        assert_eq!(e.run(args, "").status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn branch_commits_on_own_branch_and_returns() {
+    let e = repo("branch");
+    let o = e.run(&["a", "--branch"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(git(&e, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert!(e.compose().contains("o/x:1.0.0"), "default branch untouched");
+    let b = git(&e, &["branch", "--list", "strig/update-a-*", "--format=%(refname:short)"]);
+    assert!(b.starts_with("strig/update-a-"), "{b}");
+    assert!(git(&e, &["log", "-1", "--format=%B", &b]).starts_with("chore(a): update images\n\n- x: 1.0.0 -> 1.1.0"));
+    // same day again: the branch exists
+    assert!(err(&e.run(&["a", "--branch"], "")).contains("already exists"));
+}
+
+#[test]
+fn commit_aborts_on_dirty_target_file_only() {
+    let e = repo("dirty");
+    fs::write(e.root.join("stacks/a/other.txt"), "x").unwrap();
+    assert!(e.run(&["a", "--commit"], "").status.success());
+    assert!(git(&e, &["log", "-1", "--format=%s"]).starts_with("chore(a): update images"));
+    fs::write(e.root.join("stacks/a/compose.yml"), "services:\n  x:\n    image: o/x:1.0.0\n").unwrap();
+    let o = e.run(&["a", "--commit"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(err(&o).contains("uncommitted"), "{}", err(&o));
+}
+
+#[test]
+fn push_pushes_the_branch() {
+    let e = repo("push");
+    assert!(e.run(&["a", "--branch", "--push"], "").status.success());
+    assert!(git(&e, &["ls-remote", "--heads", "origin"]).contains("strig/update-a-"));
+}
+
+fn fake(e: &Env, name: &str, body: &str) {
+    let p = e.root.join("bin").join(name);
+    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// ssh runs the command locally; docker reports one healthy container; ansible-playbook exits with `ansible_rc`.
+fn fake_host(e: &Env, ansible_rc: i32) {
+    fake(e, "ssh", "sh -c \"$4\"");
+    fake(e, "docker", "case \"$1\" in ps) echo c1;; inspect) echo '/c running 0 0 healthy';; esac");
+    fake(e, "ansible-playbook", &format!("exit {ansible_rc}"));
+}
+
+#[test]
+fn single_branch_has_one_commit_per_stack_and_pr_uses_default_base() {
+    let e = repo("single");
+    // second stack
+    fs::create_dir_all(e.root.join("stacks/b")).unwrap();
+    fs::write(e.root.join("stacks/b/compose.yml"), "services:\n  z:\n    image: o/z:1.0.0\n").unwrap();
+    fs::write(e.root.join("host_vars/pi/stacks.yml"), "stacks:\n  - a\n  - b\n").unwrap();
+    git(&e, &["add", "."]); git(&e, &["commit", "-qm", "b"]); git(&e, &["push", "-q"]);
+    fake(&e, "gh", "echo \"$@\" > \"$(dirname \"$0\")/gh.args\"; echo https://example/pr/1");
+    let o = e.run(&["--all", "--single-branch=strig/custom", "--pr"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(git(&e, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert_eq!(git(&e, &["rev-list", "--count", "main..strig/custom"]), "2");
+    assert!(git(&e, &["ls-remote", "--heads", "origin", "strig/custom"]).contains("strig/custom"));
+    let a = fs::read_to_string(e.root.join("bin/gh.args")).unwrap();
+    assert!(a.contains("pr create --base main --head strig/custom"), "{a}");
+}
+
+#[test]
+fn pin_commit_message() {
+    let e = repo("pin");
+    fs::write(e.root.join("stacks/a/compose.yml"), "services:\n  x:\n    image: o/x:latest\n").unwrap();
+    git(&e, &["commit", "-qam", "latest"]);
+    let o = e.run(&["--pin", "a", "--commit"], "");
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(git(&e, &["log", "-1", "--format=%s"]), "chore(a): pin image digests");
+}
+
+#[test]
+fn push_after_deploy_only_when_healthy() {
+    let e = repo("deploy-ok");
+    fake_host(&e, 0);
+    let o = e.run(&["a", "--deploy", "--branch", "--push"], "");
+    assert!(o.status.success(), "{}{}", err(&o), String::from_utf8_lossy(&o.stdout));
+    assert!(git(&e, &["ls-remote", "--heads", "origin"]).contains("strig/update-a-"));
+
+    let e = repo("deploy-fail");
+    fake_host(&e, 1);
+    let o = e.run(&["a", "--deploy", "--branch", "--push"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!git(&e, &["ls-remote", "--heads", "origin"]).contains("strig/update-a-"), "failed deploy must not be pushed");
+    assert!(!git(&e, &["branch", "--list", "strig/update-a-*"]).is_empty(), "commit stays local");
+    assert_eq!(git(&e, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+}
+
+#[test]
+fn branch_flags_need_default_branch_not_behind_origin() {
+    let e = repo("preflight");
+    git(&e, &["switch", "-qc", "other"]);
+    let o = e.run(&["a", "--branch"], "");
+    assert!(err(&o).contains("default branch `main`"), "{}", err(&o));
+    git(&e, &["switch", "-q", "main"]);
+    fs::write(e.root.join("new.txt"), "x").unwrap();
+    git(&e, &["add", "new.txt"]); git(&e, &["commit", "-qm", "ahead"]); git(&e, &["push", "-q"]);
+    git(&e, &["reset", "-q", "--hard", "HEAD~1"]);
+    let o = e.run(&["a", "--branch"], "");
+    assert!(err(&o).contains("behind origin"), "{}", err(&o));
+    assert!(e.compose().contains("o/x:1.0.0"), "nothing written");
+}
+
+#[test]
+fn single_branch_with_failed_stack_is_not_pushed() {
+    let e = repo("single-fail");
+    fake_host(&e, 1);
+    let o = e.run(&["--all", "--deploy", "--single-branch", "--push"], "");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!git(&e, &["ls-remote", "--heads", "origin"]).contains("strig/update-"), "not pushed");
+    assert_eq!(git(&e, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+}

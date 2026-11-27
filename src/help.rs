@@ -149,7 +149,7 @@ Compares Git with what runs on each host; prints one line per finding, or `no dr
     differs   ~/homelab/stacks/<n>/compose.yml on the host is missing or != compose.yml in Git (only compose.yml is compared)
 
 Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a warning.",
-        "update" => "strig update [-i|--interactive] [--deploy] [--major] [--include <pattern>...] [--exclude <pattern>...] --check [<stack>|--all] | strig update --pin <stack>|--all | strig update <stack>|--all
+        "update" => "strig update [-i|--interactive] [--deploy] [--major] [--commit|--branch|--single-branch[=<name>]|--push|--pr] [--include <pattern>...] [--exclude <pattern>...] --check|--pin|(plain) <stack>|--all   (exactly one stack or --all)
 
     --check            Show newer tags (same format: prefix, suffix, number of parts) and the registry digest of `latest`. Writes nothing.
     -i, --interactive  Interactive (plain update only): per image `Y` apply, `n` keep, a tag to use that version instead (checked in
@@ -161,6 +161,13 @@ Exit 1 on findings. Hosts that are not reachable over SSH are skipped with a war
                        checked; the deploy and the health check still cover the whole stack (compose restarts only what changed).
     --deploy           Also deploy after writing the files (pull, Ansible, health check). Without it (and without -i) only the files
                        change and the output says `NOT deployed; run: strig deploy <stack>`. With -i the deploy is asked instead.
+    --commit           Commit the written files (one commit per stack, `chore(<stack>): update images`, `... pin image digests` for --pin)
+                       on the current branch. Aborts a stack whose compose/.env files have uncommitted changes (exit 1).
+    --branch           Commit each stack on its own branch `strig/update-<stack>-<YYYYMMDD>`, started from the repo's default branch (must be
+                       checked out and not behind origin; existing branches abort). Switches back to it after each stack. Implies --commit.
+    --single-branch[=<name>]  With --all: one shared branch (`strig/update-<YYYYMMDD>`), one commit per stack. Implies --commit.
+    --push             Push the branch (needs --branch/--single-branch). With --deploy only after a healthy deploy; failed stacks stay local.
+    --pr               Open a PR against the default branch via `gh pr create` (implies --push).
     --major            Also take major jumps. Default: stay in the same major (for 0.x the first non-zero part counts: 0.21.x stays 0.21.x);
                        a higher one is only shown as `(major available: ...)`.
     --pin              Rewrite `latest`/untagged images to repo:<tag>@sha256:<digest> (tag found by digest among the 20 newest

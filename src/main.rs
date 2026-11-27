@@ -1,6 +1,7 @@
 mod coolify;
 mod doctor;
 mod domain;
+mod gitops;
 mod help;
 mod mv;
 mod mvstack;
